@@ -19,7 +19,8 @@ test:
 	$(GO) test ./...
 
 build:
-	$(GO) build -o bin/ ./cmd/...
+	$(GO) build -o bin/agent ./cmd/agent
+	$(GO) build -o bin/server ./cmd/server
 
 ## release: static binaries for every supported machine in the fleet
 release:

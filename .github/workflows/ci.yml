@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # The zero-warning policy: a warning is a build break (AGENT.md).
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.13.2
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: agentic_stats
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The integration tests must run as a role that cannot bypass row-level
+      # security. As a superuser they would pass while proving nothing.
+      - name: Prepare test database
+        run: ./scripts/setup-test-db.sh "postgres://postgres:postgres@127.0.0.1:5432/agentic_stats?sslmode=disable"
+
+      - name: Test
+        env:
+          AGENTIC_STATS_TEST_DATABASE_URL: postgres://agentic_app:agentic_app@127.0.0.1:5432/agentic_stats?sslmode=disable
+        run: go test -race -coverpkg=./... -coverprofile=coverage.out ./...
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out | tail -1
+
+      # A skipped integration suite would hide a broken database contract.
+      - name: Assert integration tests actually ran
+        env:
+          AGENTIC_STATS_TEST_DATABASE_URL: postgres://agentic_app:agentic_app@127.0.0.1:5432/agentic_stats?sslmode=disable
+        run: |
+          output="$(go test -count=1 -v ./internal/integration/... 2>&1)"
+          echo "$output" | tail -20
+          if echo "$output" | grep -q "SKIP"; then
+            echo "::error::integration tests were skipped; the database was not reachable"
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: darwin,  goarch: arm64 }
+          - { goos: linux,   goarch: amd64 }
+          - { goos: linux,   goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The collector must be a dependency-free static binary: it gets dropped
+      # onto machines that have no toolchain.
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -trimpath -ldflags "-s -w" -o /tmp/ ./cmd/...
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

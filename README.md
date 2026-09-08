@@ -35,7 +35,50 @@ control, so the history survives, and gives you a dashboard over the whole fleet
 
 ## Status
 
-Early. See `docs/` for the design. Not yet usable.
+Working end to end: the collector discovers transcripts, ships them to the server, and the
+server stores and summarises them. There is no web UI yet -- the API returns JSON.
+
+## Quickstart
+
+Requires Go and a PostgreSQL 17 you can reach.
+
+```sh
+# 1. Prepare the database. The application role must NOT be a superuser:
+#    superusers bypass row-level security, which is what isolates tenants.
+./scripts/setup-test-db.sh "postgres://postgres@localhost:5432/agentic_stats?sslmode=disable"
+export AGENTIC_STATS_DATABASE_URL="postgres://agentic_app:agentic_app@localhost:5432/agentic_stats?sslmode=disable"
+
+# 2. Build, create a user, and start the server (migrations run automatically).
+make build
+AGENTIC_STATS_PASSWORD=... ./bin/server create-user --email you@example.com --admin
+./bin/server serve --addr 127.0.0.1:8080
+
+# 3. Enroll this machine and collect.
+./bin/server enroll-code --email you@example.com          # prints a one-time code
+./bin/agent enroll --server http://127.0.0.1:8080 --code <code>
+./bin/agent once                                          # or: ./bin/agent run
+
+# 4. Read it back.
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/v1/summary
+```
+
+`/v1/summary` reports folded token totals per model, API-equivalent cost, the cache hit rate,
+and what prompt caching saved. `/v1/daily` breaks it down by day.
+
+## Getting the numbers right
+
+Claude Code writes one JSONL line per content block, and every line repeats the complete
+usage object for the whole API response. Summing them naively over-counts, and by a different
+factor per metric, so it cannot be corrected afterwards. Measured on a real archive:
+
+| metric | naive sum | folded by `requestId` | over-count |
+|---|---|---|---|
+| output tokens | 13,095,501 | 5,249,480 | 2.49x |
+| thinking tokens | 6,278,373 | 2,071,020 | 3.03x |
+| cache reads | 4,477,680,713 | 2,347,702,854 | 1.91x |
+
+The fold happens once, in `internal/derive`, and the `request_usage` uniqueness constraint
+makes double-counting structurally impossible rather than a rule to remember.
 
 ## Design principles
 
