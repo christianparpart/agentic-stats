@@ -7,6 +7,7 @@ linters:
     - copyloopvar
     - depguard
     - errorlint
+    - forbidigo
     - gocritic
     - misspell
     - nilerr
@@ -18,13 +19,26 @@ linters:
   settings:
     errcheck:
       check-type-assertions: true
-      check-blank: true
+      # check-blank stays off deliberately. An explicit `_ = f.Close()` is a
+      # statement of intent and AGENT.md requires a comment saying why;
+      # silently dropping a returned error is what this linter must catch.
+      check-blank: false
 
     errorlint:
       # Wrap with %w; compare with errors.Is/As, never string matching. See AGENT.md.
       errorf: true
       asserts: true
       comparison: true
+
+    forbidigo:
+      # The agent ships on Windows and transcript directory names are
+      # derived from OS paths, so slash-only path handling is a
+      # correctness bug. depguard cannot express this: it prefix-matches,
+      # so denying "path" would also deny "path/filepath".
+      forbid:
+        - pattern: '^path\.(Join|Dir|Base|Clean|Ext|Split)$'
+          msg: 'use path/filepath, not path; the agent runs on Windows too (AGENT.md)'
+      analyze-types: true
 
     revive:
       rules:
@@ -66,15 +80,6 @@ linters:
               desc: "lower layers must not import the HTTP layer (AGENT.md: Architecture)"
             - pkg: github.com/christianparpart/agentic-stats/internal/rollup
               desc: "lower layers must not import rollup (AGENT.md: Architecture)"
-
-        # Transcript paths are path-derived and the agent ships on Windows.
-        filepath-not-path:
-          files:
-            - "**/internal/source/**"
-            - "**/internal/cursor/**"
-          deny:
-            - pkg: "path"
-              desc: "use path/filepath; transcript directory names are OS-path-derived (AGENT.md)"
 
 formatters:
   enable:
