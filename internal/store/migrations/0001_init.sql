@@ -4,7 +4,9 @@
 -- added later: this database holds complete transcripts, including source code,
 -- and isolation must never depend on remembering a WHERE clause.
 
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
+-- gen_random_uuid() is built into PostgreSQL 13 and later, so no extension is
+-- required. That matters: CREATE EXTENSION needs database-owner rights, and the
+-- application role deliberately has none.
 
 CREATE TABLE users (
     id            uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
