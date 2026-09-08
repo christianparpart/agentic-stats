@@ -1,0 +1,90 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - copyloopvar
+    - depguard
+    - errorlint
+    - gocritic
+    - misspell
+    - nilerr
+    - noctx
+    - revive
+    - unconvert
+    - wastedassign
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+
+    errorlint:
+      # Wrap with %w; compare with errors.Is/As, never string matching. See AGENT.md.
+      errorf: true
+      asserts: true
+      comparison: true
+
+    revive:
+      rules:
+        - name: exported
+        - name: context-as-argument
+        - name: error-return
+        - name: error-strings
+        - name: indent-error-flow
+        - name: unexported-return
+
+    depguard:
+      rules:
+        # --- Architectural boundary, from AGENT.md ---
+        # The agent ships bytes; it must not interpret transcripts. This is what
+        # lets collection keep working when the log format changes underneath us.
+        collector-must-not-interpret:
+          files:
+            - "**/internal/source/**"
+            - "**/internal/cursor/**"
+            - "**/internal/wire/**"
+          deny:
+            - pkg: github.com/christianparpart/agentic-stats/internal/derive
+              desc: "the collector must not interpret transcripts (AGENT.md: Architecture)"
+            - pkg: github.com/christianparpart/agentic-stats/internal/pricing
+              desc: "pricing is a server-side concern (AGENT.md: Architecture)"
+            - pkg: github.com/christianparpart/agentic-stats/internal/store
+              desc: "the agent never talks to the database (AGENT.md: Architecture)"
+
+        # Lower layers must not import higher ones.
+        no-upward-imports:
+          files:
+            - "**/internal/source/**"
+            - "**/internal/cursor/**"
+            - "**/internal/wire/**"
+            - "**/internal/redact/**"
+            - "**/internal/derive/**"
+          deny:
+            - pkg: github.com/christianparpart/agentic-stats/internal/api
+              desc: "lower layers must not import the HTTP layer (AGENT.md: Architecture)"
+            - pkg: github.com/christianparpart/agentic-stats/internal/rollup
+              desc: "lower layers must not import rollup (AGENT.md: Architecture)"
+
+        # Transcript paths are path-derived and the agent ships on Windows.
+        filepath-not-path:
+          files:
+            - "**/internal/source/**"
+            - "**/internal/cursor/**"
+          deny:
+            - pkg: "path"
+              desc: "use path/filepath; transcript directory names are OS-path-derived (AGENT.md)"
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/christianparpart/agentic-stats
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

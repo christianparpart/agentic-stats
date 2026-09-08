@@ -1,15 +1,19 @@
 GO ?= go
 PLATFORMS := darwin/arm64 linux/amd64 linux/arm64 windows/amd64
 
-.PHONY: check fmt vet test build release clean
+.PHONY: check fmt vet lint test build release clean
 
-check: fmt vet test
+check: fmt vet lint test
 
 fmt:
 	$(GO) fmt ./...
 
 vet:
 	$(GO) vet ./...
+
+## lint: zero-warning policy — fix the cause, never //nolint
+lint:
+	golangci-lint run
 
 test:
 	$(GO) test ./...
