@@ -1,5 +1,7 @@
 # agentic-stats
 
+[![CI](https://github.com/christianparpart/agentic-stats/actions/workflows/ci.yml/badge.svg)](https://github.com/christianparpart/agentic-stats/actions/workflows/ci.yml)
+
 Fleet-wide analytics and a durable archive for AI coding assistants.
 
 You use Claude Code on a laptop, a desktop and a couple of VMs. Each machine keeps a
