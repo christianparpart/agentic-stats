@@ -1,0 +1,21 @@
+#!/bin/sh
+# agentic-stats pre-commit guard.
+# Enable with:  git config core.hooksPath .githooks
+set -e
+
+if command -v gitleaks >/dev/null 2>&1; then
+    gitleaks protect --staged --redact --verbose || {
+        echo
+        echo "gitleaks found a secret in staged changes. Do NOT use --no-verify."
+        echo "Remove the secret, then re-stage."
+        exit 1
+    }
+else
+    echo "warning: gitleaks not installed; skipping secret scan (brew install gitleaks)" >&2
+fi
+
+# Real transcripts must never be committed. Synthetic fixtures only.
+if git diff --cached --name-only -z | grep -zE '(^|/)testdata/real/' >/dev/null 2>&1; then
+    echo "error: testdata/real/ must never be committed. See CONTRIBUTING.md." >&2
+    exit 1
+fi

@@ -1,0 +1,38 @@
+# agentic-stats agent configuration — EXAMPLE
+# Copy to ~/.config/agentic-stats/agent.toml and edit.
+# The real file is gitignored. Never commit it.
+
+[server]
+# Base URL of your agentic-stats server.
+url = "https://stats.example.com"
+
+# Device token, obtained by redeeming an enrollment code:
+#   agentic-stats-agent enroll --code ABCD-EFGH
+# Stored in the OS keychain where available; this key is the fallback.
+# token = "paste-device-token-here"
+
+[agent]
+# How often to scan the source roots for new data.
+poll_interval = "30s"
+
+# Upload batching.
+batch_max_lines = 5000
+batch_max_bytes = "8MiB"
+
+# Backfill pacing, so first run does not saturate an uplink.
+backfill_rate = "2MiB/s"
+# backfill_since = "2020-01-01"
+
+[sources.claude_code]
+enabled = true
+# Extra roots beyond the platform defaults.
+# roots = ["/opt/shared/.claude/projects"]
+
+[sources.claude_desktop]
+enabled = true
+
+[privacy]
+# Absolute path prefixes that are never read or transmitted.
+exclude_paths = [
+  # "/Users/you/work/confidential",
+]

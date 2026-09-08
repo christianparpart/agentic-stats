@@ -1,0 +1,39 @@
+# --- Secrets & local config: NEVER commit ---
+config.toml
+agent.toml
+server.toml
+*.local.*
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+secrets/
+
+# --- Real user data: NEVER commit ---
+# Fixtures must be synthetic (see CONTRIBUTING.md).
+testdata/real/
+*.jsonl
+!testdata/synthetic/**/*.jsonl
+snapshots/
+*.tar.gz
+
+# --- Build output ---
+dist/
+bin/
+/agentic-stats
+/agentic-stats-agent
+/agentic-stats-server
+*.exe
+
+# --- Frontend ---
+node_modules/
+web/dist/
+web/.vite/
+
+# --- Local state ---
+*.db
+*.bolt
+coverage.out
+.DS_Store
