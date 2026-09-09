@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"strings"
 	"time"
 )
 
@@ -376,6 +377,70 @@ func (db *DB) Digests(ctx context.Context, origin string) (map[int64]string, err
 	out := make(map[int64]string, len(acc))
 	for bucket, h := range acc {
 		out[bucket] = fmt.Sprintf("%d:%s", counts[bucket], hex.EncodeToString(h.Sum(nil)))
+	}
+	return out, nil
+}
+
+// Peer is a known node and where it was last reachable.
+type Peer struct {
+	ID       string
+	Addrs    []string
+	LastSeen string
+	Static   bool
+}
+
+// SavePeer records or refreshes a peer.
+//
+// Learned addresses are persisted so a cold start does not depend on the
+// bootstrap node being up, and so a peer that has been quiet for a week is
+// still dialled.
+func (db *DB) SavePeer(ctx context.Context, p Peer) error {
+	if p.ID == "" {
+		return errors.New("store: peer id is required")
+	}
+	static := 0
+	if p.Static {
+		static = 1
+	}
+	_, err := db.sql.ExecContext(ctx, `
+		INSERT INTO peers (peer_id, addrs, last_seen, static)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT (peer_id) DO UPDATE SET
+			addrs     = excluded.addrs,
+			last_seen = excluded.last_seen,
+			static    = max(peers.static, excluded.static)`,
+		p.ID, strings.Join(p.Addrs, ","), db.now().Format(time.RFC3339Nano), static)
+	if err != nil {
+		return fmt.Errorf("store: save peer: %w", err)
+	}
+	return nil
+}
+
+// Peers returns every peer this node knows about.
+func (db *DB) Peers(ctx context.Context) ([]Peer, error) {
+	rows, err := db.sql.QueryContext(ctx,
+		`SELECT peer_id, addrs, coalesce(last_seen, ''), static FROM peers ORDER BY peer_id`)
+	if err != nil {
+		return nil, fmt.Errorf("store: read peers: %w", err)
+	}
+	defer func() { _ = rows.Close() }() // rows fully drained below
+
+	var out []Peer
+	for rows.Next() {
+		var p Peer
+		var addrs string
+		var static int
+		if err := rows.Scan(&p.ID, &addrs, &p.LastSeen, &static); err != nil {
+			return nil, fmt.Errorf("store: scan peer: %w", err)
+		}
+		if addrs != "" {
+			p.Addrs = strings.Split(addrs, ",")
+		}
+		p.Static = static == 1
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: read peers: %w", err)
 	}
 	return out, nil
 }

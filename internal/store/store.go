@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io/fs"
 	"sort"
+	"sync"
 	"time"
 
 	_ "github.com/ncruces/go-sqlite3/driver"
@@ -35,6 +36,17 @@ type DB struct {
 	sql    *sql.DB
 	now    func() time.Time
 	origin string
+
+	// writeMu serializes write transactions.
+	//
+	// SQLite permits exactly one writer at a time even in WAL mode, and this
+	// process has several: the collector appending what it found, and one
+	// goroutine per peer applying what arrived. Without this they collide and
+	// one fails with "database is locked" after burning the whole busy
+	// timeout. Serializing in-process is both faster and more predictable
+	// than letting them fight over the file lock; readers are unaffected,
+	// which is what keeps the dashboard responsive during a large sync.
+	writeMu sync.Mutex
 }
 
 // Open connects, applies migrations, and establishes this node's identity.
@@ -94,6 +106,9 @@ func (db *DB) Now() time.Time { return db.now() }
 // Lifted from the previous Postgres store: the discipline is identical and was
 // already correct.
 func (db *DB) inTx(ctx context.Context, fn func(context.Context, *sql.Tx) error) (err error) {
+	db.writeMu.Lock()
+	defer db.writeMu.Unlock()
+
 	tx, err := db.sql.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("store: begin: %w", err)

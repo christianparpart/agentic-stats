@@ -14,7 +14,6 @@ package sync
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -153,9 +152,6 @@ func (s *Syncer) Exchange(ctx context.Context, rw io.ReadWriter, peerID string) 
 		return Stats{}, err
 	}
 
-	enc := json.NewEncoder(rw)
-	dec := json.NewDecoder(io.LimitReader(rw, maxMessageBytes))
-
 	// The receiving side hands the peer's announcement to the sender here.
 	peerVector := make(chan announcement, 1)
 
@@ -165,7 +161,7 @@ func (s *Syncer) Exchange(ctx context.Context, rw io.ReadWriter, peerID string) 
 	}
 	sendDone := make(chan sendResult, 1)
 	go func() {
-		if err := enc.Encode(message{
+		if err := writeFrame(rw, message{
 			Kind: kindVector, Vector: mine.vector, Digests: mine.digests,
 		}); err != nil {
 			sendDone <- sendResult{err: fmt.Errorf("sync: send vector: %w", err)}
@@ -178,11 +174,11 @@ func (s *Syncer) Exchange(ctx context.Context, rw io.ReadWriter, peerID string) 
 			sendDone <- sendResult{err: ctx.Err()}
 			return
 		}
-		n, err := s.send(ctx, enc, mine, theirs)
+		n, err := s.send(ctx, rw, mine, theirs)
 		sendDone <- sendResult{sent: n, err: err}
 	}()
 
-	stats, recvErr := s.receive(ctx, dec, peerVector)
+	stats, recvErr := s.receive(ctx, rw, peerVector)
 	sent := <-sendDone
 
 	stats.Sent = sent.sent
@@ -274,7 +270,7 @@ func countOf(digest string) string {
 }
 
 // send streams every record the peer lacks, then closes with a done frame.
-func (s *Syncer) send(ctx context.Context, enc *json.Encoder, mine, theirs announcement) (int, error) {
+func (s *Syncer) send(ctx context.Context, w io.Writer, mine, theirs announcement) (int, error) {
 	total := 0
 	for origin, have := range mine.vector {
 		after := resendFrom(have, theirs.vector[origin], mine.digests[origin], theirs.digests[origin])
@@ -296,14 +292,14 @@ func (s *Syncer) send(ctx context.Context, enc *json.Encoder, mine, theirs annou
 			for i, r := range batch {
 				out[i] = toWire(r)
 			}
-			if err := enc.Encode(message{Kind: kindRecords, Records: out}); err != nil {
+			if err := writeFrame(w, message{Kind: kindRecords, Records: out}); err != nil {
 				return total, fmt.Errorf("sync: send records: %w", err)
 			}
 			total += len(batch)
 			after = batch[len(batch)-1].Seq
 		}
 	}
-	if err := enc.Encode(message{Kind: kindDone}); err != nil {
+	if err := writeFrame(w, message{Kind: kindDone}); err != nil {
 		return total, fmt.Errorf("sync: send done: %w", err)
 	}
 	return total, nil
@@ -311,7 +307,7 @@ func (s *Syncer) send(ctx context.Context, enc *json.Encoder, mine, theirs annou
 
 // receive reads the peer's vector, publishes it to the sender, then applies
 // everything the peer sends until it says it is finished.
-func (s *Syncer) receive(ctx context.Context, dec *json.Decoder, peerVector chan<- announcement) (Stats, error) {
+func (s *Syncer) receive(ctx context.Context, r io.Reader, peerVector chan<- announcement) (Stats, error) {
 	var stats Stats
 	published := false
 	defer func() {
@@ -325,8 +321,8 @@ func (s *Syncer) receive(ctx context.Context, dec *json.Decoder, peerVector chan
 		if err := ctx.Err(); err != nil {
 			return stats, err
 		}
-		var msg message
-		if err := dec.Decode(&msg); err != nil {
+		msg, err := readFrame(r)
+		if err != nil {
 			if errors.Is(err, io.EOF) {
 				// The peer hung up without a done frame. What arrived is
 				// already committed, and the vector reflects only that.

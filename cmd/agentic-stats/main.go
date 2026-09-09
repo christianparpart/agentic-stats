@@ -7,10 +7,12 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -21,10 +23,12 @@ import (
 
 	"github.com/christianparpart/agentic-stats/internal/agentcfg"
 	"github.com/christianparpart/agentic-stats/internal/api"
+	"github.com/christianparpart/agentic-stats/internal/certs"
 	"github.com/christianparpart/agentic-stats/internal/collector"
 	"github.com/christianparpart/agentic-stats/internal/cursor"
 	"github.com/christianparpart/agentic-stats/internal/derive"
 	"github.com/christianparpart/agentic-stats/internal/ingest"
+	"github.com/christianparpart/agentic-stats/internal/mesh"
 	"github.com/christianparpart/agentic-stats/internal/pricing"
 	"github.com/christianparpart/agentic-stats/internal/seal"
 	"github.com/christianparpart/agentic-stats/internal/source"
@@ -153,6 +157,7 @@ type node struct {
 	db     *store.DB
 	derive *derive.Service
 	coll   *collector.Collector
+	mesh   *mesh.Mesh
 	log    *slog.Logger
 	closes []func() error
 }
@@ -160,6 +165,21 @@ type node struct {
 // openNode wires the graph. Every dependency is passed in; nothing reaches for
 // a global.
 func openNode(ctx context.Context, configPath, statePath string, log *slog.Logger) (*node, error) {
+	return openNodeWith(ctx, configPath, statePath, log, withCollector)
+}
+
+// nodeParts selects how much of the graph to build.
+type nodeParts uint8
+
+const (
+	// readOnly opens the archive alone. The cursor store is a single-process
+	// bbolt file that a running daemon holds, so a read-only command must not
+	// reach for it.
+	readOnly nodeParts = iota
+	withCollector
+)
+
+func openNodeWith(ctx context.Context, configPath, statePath string, log *slog.Logger, parts nodeParts) (*node, error) {
 	cfg, err := agentcfg.Load(configPath)
 	if err != nil {
 		return nil, err
@@ -189,6 +209,13 @@ func openNode(ctx context.Context, configPath, statePath string, log *slog.Logge
 	}
 	if n.derive, err = derive.NewService(n.db, prices); err != nil {
 		return nil, n.closeAll(err)
+	}
+
+	if err := n.buildMesh(keys, cfg, log); err != nil {
+		return nil, n.closeAll(err)
+	}
+	if parts == readOnly {
+		return n, nil
 	}
 
 	writer, err := ingest.NewWriter(n.db, keys)
@@ -227,7 +254,62 @@ func openNode(ctx context.Context, configPath, statePath string, log *slog.Logge
 	}); err != nil {
 		return nil, n.closeAll(err)
 	}
+
 	return n, nil
+}
+
+// buildMesh wires the peering subsystem.
+func (n *node) buildMesh(keys *seal.Keys, cfg agentcfg.Config, log *slog.Logger) error {
+	m, err := mesh.New(mesh.Config{
+		Store:             n.db,
+		Keys:              keys,
+		Logger:            log,
+		Listen:            cfg.Mesh.Listen,
+		StaticPeers:       cfg.Mesh.Peers,
+		Discovery:         cfg.Mesh.Discovery,
+		ExcludeInterfaces: cfg.Mesh.ExcludeInterfaces,
+	})
+	if err != nil {
+		return err
+	}
+	n.mesh = m
+	return nil
+}
+
+// isLoopback reports whether a listen address is loopback-only.
+func isLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "" {
+		// A bare ":8899" listens on every interface.
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// dashboardCertificate resolves the certificate for an off-loopback dashboard,
+// generating and persisting a self-signed one when none is configured.
+func dashboardCertificate(cfg agentcfg.Config, stateDir string) (tls.Certificate, error) {
+	if cfg.Dashboard.TLSCert != "" && cfg.Dashboard.TLSKey != "" {
+		cert, err := tls.LoadX509KeyPair(cfg.Dashboard.TLSCert, cfg.Dashboard.TLSKey)
+		if err != nil {
+			return tls.Certificate{}, fmt.Errorf("load dashboard certificate: %w", err)
+		}
+		return cert, nil
+	}
+	// Regenerated when this machine's addresses change, not merely on expiry:
+	// a stale address list is the failure people actually hit, after a VPN
+	// connects or a DHCP lease moves.
+	return certs.EnsureCertificate(certs.Config{
+		CertPath: filepath.Join(stateDir, "dashboard-cert.pem"),
+		KeyPath:  filepath.Join(stateDir, "dashboard-key.pem"),
+	})
 }
 
 // closeAll releases what has been opened so far, joining any failure to err.
@@ -294,14 +376,55 @@ func runNode(args []string, defaultPath string, m mode) error {
 		WriteTimeout:      2 * time.Minute,
 		IdleTimeout:       2 * time.Minute,
 	}
+	// Loopback stays plain HTTP on purpose: http://127.0.0.1 is already a
+	// secure context in every browser, so TLS there would buy nothing and cost
+	// a certificate warning. Anywhere else, encrypt.
+	useTLS := !isLoopback(addr)
+	if useTLS {
+		cert, cerr := dashboardCertificate(n.cfg, filepath.Dir(*configPath))
+		if cerr != nil {
+			return cerr
+		}
+		httpServer.TLSConfig = &tls.Config{
+			MinVersion:   tls.VersionTLS12,
+			Certificates: []tls.Certificate{cert},
+		}
+	}
+
 	httpErr := make(chan error, 1)
 	go func() {
-		log.Info("dashboard listening", "addr", addr, "origin", n.db.OriginID(), "version", version)
+		scheme := "http"
+		if useTLS {
+			scheme = "https"
+		}
+		log.Info("dashboard listening",
+			"url", scheme+"://"+addr, "origin", n.db.OriginID(), "version", version)
 		log.Info(api.Describe())
+		if useTLS {
+			if n.cfg.Dashboard.TLSCert == "" {
+				log.Warn("using a self-signed certificate; your browser will warn once " +
+					"unless you supply dashboard.tls_cert")
+			}
+			if err := httpServer.ListenAndServeTLS("", ""); err != nil &&
+				!errors.Is(err, http.ErrServerClosed) {
+				httpErr <- err
+			}
+			return
+		}
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			httpErr <- err
 		}
 	}()
+
+	// Peering runs alongside collection.
+	meshErr := make(chan error, 1)
+	if n.mesh != nil {
+		go func() {
+			if err := n.mesh.Run(ctx); err != nil {
+				meshErr <- err
+			}
+		}()
+	}
 
 	poll := *interval
 	if poll <= 0 {
@@ -322,6 +445,8 @@ func runNode(args []string, defaultPath string, m mode) error {
 		select {
 		case err := <-httpErr:
 			return fmt.Errorf("dashboard: %w", err)
+		case err := <-meshErr:
+			return fmt.Errorf("mesh: %w", err)
 		case <-ctx.Done():
 			log.Info("stopping")
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -340,7 +465,7 @@ func runStatus(args []string, defaultPath string) error {
 		return err
 	}
 	ctx := context.Background()
-	n, err := openNode(ctx, *configPath, *statePath, slog.New(slog.DiscardHandler))
+	n, err := openNodeWith(ctx, *configPath, *statePath, slog.New(slog.DiscardHandler), readOnly)
 	if err != nil {
 		return err
 	}
@@ -369,6 +494,19 @@ func runStatus(args []string, defaultPath string) error {
 		}
 		fmt.Printf("  %s  up to %d%s\n", origin, seq, marker)
 	}
+	peers, err := n.mesh.KnownPeers(ctx)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("peers    %d\n", len(peers))
+	for _, p := range peers {
+		seen := p.LastSeen
+		if seen == "" {
+			seen = "never"
+		}
+		fmt.Printf("  %-34s %v  last seen %s\n", p.ID, p.Addrs, seen)
+	}
+
 	if quarantined > 0 {
 		fmt.Printf("\nWARNING: %d quarantined records.\n", quarantined)
 		fmt.Println("Two machines are issuing records under the same origin id — most likely a")
