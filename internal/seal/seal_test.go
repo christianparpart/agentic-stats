@@ -215,3 +215,61 @@ func mustGenerate(t *testing.T) string {
 	}
 	return psk
 }
+
+// A user-chosen passphrase is accepted, and must derive the same key on every
+// node however it was typed.
+func TestPassphrasesAreAcceptedAndStable(t *testing.T) {
+	const phrase = "correct horse battery staple 42"
+	a := mustDerive(t, phrase)
+	b := mustDerive(t, "  "+phrase+"  ")
+	if !seal.Equal(a.DashboardKey(), b.DashboardKey()) {
+		t.Error("surrounding whitespace changed the derived key")
+	}
+
+	sealed, err := a.SealPayload([]byte("hello"))
+	if err != nil {
+		t.Fatalf("SealPayload: %v", err)
+	}
+	if _, err := b.OpenPayload(sealed); err != nil {
+		t.Fatalf("a peer with the same passphrase could not open the record: %v", err)
+	}
+
+	// A passphrase must not collide with a different one.
+	other := mustDerive(t, "a completely different passphrase entirely")
+	if seal.Equal(a.DashboardKey(), other.DashboardKey()) {
+		t.Error("two different passphrases derived the same key")
+	}
+}
+
+// A passphrase is stretched rather than used raw, which is what makes offline
+// guessing expensive against ciphertext that lives in a synced folder.
+func TestPassphrasesAreStretched(t *testing.T) {
+	const phrase = "a passphrase long enough to pass"
+	raw, err := seal.Parse(phrase)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if string(raw) == phrase {
+		t.Fatal("the passphrase was used verbatim as key material")
+	}
+	if len(raw) != 32 {
+		t.Errorf("derived %d bytes, want 32", len(raw))
+	}
+	// Deterministic across calls, or two nodes could never agree.
+	again, err := seal.Parse(phrase)
+	if err != nil {
+		t.Fatalf("Parse again: %v", err)
+	}
+	if !seal.Equal(raw, again) {
+		t.Error("stretching is not deterministic; nodes would never agree")
+	}
+}
+
+// Too short to be worth stretching.
+func TestShortPassphrasesAreStillRefused(t *testing.T) {
+	for _, weak := range []string{"hunter2", "short phrase", "12345678901234567890"[:19]} {
+		if _, err := seal.Derive(weak); !errors.Is(err, seal.ErrWeakPSK) {
+			t.Errorf("Derive(%q) = %v, want ErrWeakPSK", weak, err)
+		}
+	}
+}

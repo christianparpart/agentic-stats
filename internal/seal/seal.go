@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"strings"
 
+	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
@@ -128,25 +129,57 @@ func Derive(psk string) (*Keys, error) {
 	return k, nil
 }
 
-// Parse normalizes and validates a pre-shared key, returning its raw bytes.
+// MinPassphraseChars is the shortest passphrase accepted.
+//
+// Deliberately higher than the byte floor for a generated key: a generated key
+// carries 256 bits of real entropy in 52 characters, while a human-chosen
+// phrase of the same length carries a fraction of that.
+const MinPassphraseChars = 20
+
+// Parse normalizes and validates a pre-shared key, returning 32 bytes of key
+// material.
+//
+// Two kinds of key are accepted, and they are treated differently on purpose.
+//
+// A key produced by Generate is high-entropy random already, so its decoded
+// bytes are used directly.
+//
+// Anything else is treated as a human-chosen passphrase and stretched with
+// argon2id before use. A memorable phrase carries far less entropy than its
+// length suggests, and this archive's ciphertext is exposed by design -- it
+// sits in a synced folder and on every node's disk -- so an attacker can guess
+// offline at whatever rate their hardware allows. Stretching makes each guess
+// cost memory and time instead of a hash.
+//
+// The salt is a fixed application string rather than a random per-user value,
+// because every node must derive identical keys from the same passphrase with
+// no way to exchange a salt beforehand. That is the accepted cost of a
+// pre-shared secret: it rules out a per-user salt, which is another reason to
+// prefer a generated key.
 func Parse(psk string) ([]byte, error) {
-	normalized := strings.ToUpper(strings.NewReplacer("-", "", " ", "", "\t", "").Replace(strings.TrimSpace(psk)))
-	if normalized == "" {
+	trimmed := strings.TrimSpace(psk)
+	if trimmed == "" {
 		return nil, fmt.Errorf("%w: empty", ErrWeakPSK)
 	}
-	raw, err := pskEncoding.DecodeString(normalized)
-	if err != nil {
-		// Accept an arbitrary passphrase, but hold it to the same entropy bar
-		// by length. Anything shorter is refused rather than stretched, since
-		// stretching a weak secret would only disguise the weakness.
-		raw = []byte(psk)
+
+	// A generated key survives being retyped with different grouping or case.
+	normalized := strings.ToUpper(strings.NewReplacer("-", "", " ", "", "\t", "").Replace(trimmed))
+	if raw, err := pskEncoding.DecodeString(normalized); err == nil && len(raw) >= MinPSKBytes {
+		return raw, nil
 	}
-	if len(raw) < MinPSKBytes {
-		return nil, fmt.Errorf("%w: %d bytes, need at least %d (use `agentic-stats init` to generate one)",
-			ErrWeakPSK, len(raw), MinPSKBytes)
+
+	if len([]rune(trimmed)) < MinPassphraseChars {
+		return nil, fmt.Errorf(
+			"%w: a passphrase needs at least %d characters, or run `agentic-stats init` "+
+				"to generate a key", ErrWeakPSK, MinPassphraseChars)
 	}
-	return raw, nil
+	// 64 MiB and three passes: enough to make bulk guessing expensive, little
+	// enough that a Raspberry Pi can still start a daemon.
+	return argon2.IDKey([]byte(trimmed), []byte(passphraseSalt), 3, 64*1024, 4, 32), nil
 }
+
+// passphraseSalt domain-separates this use of argon2id from any other.
+const passphraseSalt = "agentic-stats passphrase v1"
 
 // SealPayload encrypts a record body. The nonce is prepended to the ciphertext.
 func (k *Keys) SealPayload(plaintext []byte) ([]byte, error) {

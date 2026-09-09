@@ -47,7 +47,7 @@ external storage, and each serves its own dashboard.
 
 ## Quickstart
 
-Requires only Go. No database server, no cloud account, no certificates.
+Requires only Go. No database server, no cloud account, no certificates, no root.
 
 ```sh
 make build
@@ -62,7 +62,17 @@ make build
 ./bin/agentic-stats run           # dashboard on http://127.0.0.1:8899
 ./bin/agentic-stats once          # or a single pass and exit
 ./bin/agentic-stats status        # what this node holds, and its peers
+
+# Start automatically at login.
+./bin/agentic-stats install       # launchd, systemd --user, or Task Scheduler
+./bin/agentic-stats service       # is it installed and running?
+./bin/agentic-stats uninstall     # remove; the archive is untouched
 ```
+
+`install` registers a **user** service on all three platforms -- the daemon reads one
+person's home directory, so it never needs root or an administrator. On Linux it also
+attempts `loginctl enable-linger`, without which a user service stops the moment you log
+out, which is exactly wrong on a headless VM.
 
 Nodes on the same network find each other automatically. For machines separated by a
 WireGuard or Tailscale tunnel, list them under `mesh.peers` -- multicast cannot cross a
@@ -77,6 +87,10 @@ path = "~/Dropbox/agentic-stats"
 
 Any synced folder, NAS or SMB share works. Bundles written there are encrypted, including
 their metadata, because the storage provider is not trusted.
+
+The mesh key can be the generated one or any passphrase of at least 20 characters --
+passphrases are stretched with argon2id, since a memorable phrase carries far less entropy
+than its length suggests and this archive's ciphertext is exposed by design.
 
 Open the dashboard and sign in with the mesh key. It shows cost, cache savings, the cache
 hit rate, cost per active day and a per-model breakdown; `/v1/summary` and `/v1/daily`

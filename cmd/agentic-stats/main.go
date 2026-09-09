@@ -33,6 +33,7 @@ import (
 	"github.com/christianparpart/agentic-stats/internal/mesh"
 	"github.com/christianparpart/agentic-stats/internal/pricing"
 	"github.com/christianparpart/agentic-stats/internal/seal"
+	"github.com/christianparpart/agentic-stats/internal/service"
 	"github.com/christianparpart/agentic-stats/internal/source"
 	"github.com/christianparpart/agentic-stats/internal/source/claudecode"
 	"github.com/christianparpart/agentic-stats/internal/store"
@@ -49,6 +50,10 @@ Usage:
   agentic-stats once     Collect once and exit
   agentic-stats run      Collect continuously and serve the dashboard
   agentic-stats status   Report what this node holds
+
+  agentic-stats install    Start automatically when you log in
+  agentic-stats uninstall  Remove the autostart entry
+  agentic-stats service    Report whether the autostart entry is running
 
 Configuration lives in %s.
 The mesh key may also be supplied as $AGENTIC_STATS_PSK.
@@ -81,6 +86,12 @@ func run(args []string) error {
 		return runNode(args[1:], defaultPath, modeRun)
 	case "status":
 		return runStatus(args[1:], defaultPath)
+	case "install":
+		return runInstall(args[1:], defaultPath)
+	case "uninstall":
+		return runUninstall(args[1:])
+	case "service":
+		return runServiceStatus(args[1:])
 	case "-h", "--help", "help":
 		fmt.Printf(usage, version, defaultPath)
 		return nil
@@ -582,6 +593,84 @@ func (n *node) runBridge(ctx context.Context, log *slog.Logger) {
 		case <-ticker.C:
 		}
 	}
+}
+
+// runInstall registers the daemon to start at login.
+func runInstall(args []string, defaultPath string) error {
+	fs := flag.NewFlagSet("install", flag.ExitOnError)
+	configPath := fs.String("config", defaultPath, "configuration file the service should use")
+	statePath := fs.String("state", "", "archive database path")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	// Refuse to install a node that cannot start: a service that fails at
+	// every login is worse than no service, because nothing surfaces it.
+	cfg, err := agentcfg.Load(*configPath)
+	if err != nil {
+		return err
+	}
+	if cfg.Mesh.PSK == "" {
+		return fmt.Errorf("no mesh key configured in %s: run `agentic-stats init` "+
+			"(or `join --key <key>`) before installing the service", *configPath)
+	}
+
+	mgr, err := service.New()
+	if err != nil {
+		return err
+	}
+	st, err := mgr.Install(service.Config{ConfigPath: *configPath, StatePath: *statePath})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("installed: %s\n", st.DefinitionPath)
+	fmt.Printf("status:    %s\n", st.Detail)
+	fmt.Printf("\nIt will start automatically when you log in.\n")
+	fmt.Printf("Dashboard: http://%s\n", cfg.Dashboard.Listen)
+	return nil
+}
+
+// runUninstall removes the autostart entry.
+func runUninstall(args []string) error {
+	fs := flag.NewFlagSet("uninstall", flag.ExitOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	mgr, err := service.New()
+	if err != nil {
+		return err
+	}
+	if err := mgr.Uninstall(); err != nil {
+		return err
+	}
+	fmt.Println("removed; the archive and configuration are untouched")
+	return nil
+}
+
+// runServiceStatus reports what the platform knows about the service.
+func runServiceStatus(args []string) error {
+	fs := flag.NewFlagSet("service", flag.ExitOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	mgr, err := service.New()
+	if err != nil {
+		return err
+	}
+	st, err := mgr.Status()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("installed  %v\n", st.Installed)
+	fmt.Printf("running    %v\n", st.Running)
+	fmt.Printf("definition %s\n", st.DefinitionPath)
+	if st.Detail != "" {
+		fmt.Printf("detail     %s\n", st.Detail)
+	}
+	if !st.Installed {
+		fmt.Println("\nInstall it with: agentic-stats install")
+	}
+	return nil
 }
 
 // reportPass logs the outcome of one collection pass.
