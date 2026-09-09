@@ -38,7 +38,8 @@ control, so the history survives, and gives you a dashboard over the whole fleet
 ## Status
 
 Working end to end: the collector discovers transcripts, ships them to the server, and the
-server stores and summarises them. There is no web UI yet -- the API returns JSON.
+server stores, summarises and displays them. The dashboard is served at `/` from the server
+binary -- one file, nothing to deploy alongside it.
 
 ## Quickstart
 
@@ -60,12 +61,14 @@ AGENTIC_STATS_PASSWORD=... ./bin/server create-user --email you@example.com --ad
 ./bin/agent enroll --server http://127.0.0.1:8080 --code <code>
 ./bin/agent once                                          # or: ./bin/agent run
 
-# 4. Read it back.
+# 4. Open http://127.0.0.1:8080/ and sign in, or read the JSON directly.
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/v1/summary
 ```
 
-`/v1/summary` reports folded token totals per model, API-equivalent cost, the cache hit rate,
-and what prompt caching saved. `/v1/daily` breaks it down by day.
+The dashboard shows cost, cache savings, the cache hit rate, cost per active day and a
+per-model breakdown. `/v1/summary` and `/v1/daily` return the same figures as JSON, and
+accept either a device token or a browser session -- one API, not two. Ingest stays
+device-only: a browser session can read the archive but never write to it.
 
 ## Getting the numbers right
 

@@ -53,11 +53,17 @@ func NewServer(cfg Config) (*Server, error) {
 // Handler builds the HTTP routes.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", s.handleDashboard)
 	mux.HandleFunc("GET /healthz", s.handleHealth)
+	mux.HandleFunc("POST /v1/login", s.handleLogin)
+	mux.HandleFunc("POST /v1/logout", s.handleLogout)
 	mux.HandleFunc("POST /v1/devices/enroll", s.handleEnroll)
+	// Ingest is device-only: a browser session must never be able to write
+	// into the archive.
 	mux.HandleFunc("POST /v1/ingest", s.withDevice(s.handleIngest))
-	mux.HandleFunc("GET /v1/summary", s.withDevice(s.handleSummary))
-	mux.HandleFunc("GET /v1/daily", s.withDevice(s.handleDaily))
+	// Reads accept either a device token or a dashboard session.
+	mux.HandleFunc("GET /v1/summary", s.withTenant(s.handleSummary))
+	mux.HandleFunc("GET /v1/daily", s.withTenant(s.handleDaily))
 	return mux
 }
 
@@ -154,8 +160,8 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request, dev auth.D
 	s.respond(w, http.StatusOK, result)
 }
 
-func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request, dev auth.Device) {
-	summary, err := s.derive.Summarize(r.Context(), dev.UserID)
+func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request, userID string) {
+	summary, err := s.derive.Summarize(r.Context(), userID)
 	if err != nil {
 		s.log.Error("summarize", "error", err)
 		s.fail(w, http.StatusInternalServerError, "summary failed")
@@ -164,14 +170,107 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request, dev auth.
 	s.respond(w, http.StatusOK, summary)
 }
 
-func (s *Server) handleDaily(w http.ResponseWriter, r *http.Request, dev auth.Device) {
-	days, err := s.derive.Daily(r.Context(), dev.UserID)
+func (s *Server) handleDaily(w http.ResponseWriter, r *http.Request, userID string) {
+	days, err := s.derive.Daily(r.Context(), userID)
 	if err != nil {
 		s.log.Error("daily", "error", err)
 		s.fail(w, http.StatusInternalServerError, "daily failed")
 		return
 	}
 	s.respond(w, http.StatusOK, map[string]any{"days": days})
+}
+
+// sessionCookie is the dashboard's session cookie name.
+const sessionCookie = "agentic_session"
+
+// tenantHandler is a handler that runs with a resolved tenant.
+type tenantHandler func(http.ResponseWriter, *http.Request, string)
+
+// withTenant resolves the tenant from either a device token or a dashboard
+// session, so the dashboard and the collector share one set of read endpoints.
+func (s *Server) withTenant(next tenantHandler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if token := bearerToken(r); token != "" {
+			dev, err := s.auth.AuthenticateDevice(r.Context(), token)
+			if err == nil {
+				next(w, r, dev.UserID)
+				return
+			}
+			if !errors.Is(err, auth.ErrInvalidCredential) {
+				s.log.Error("authenticate device", "error", err)
+				s.fail(w, http.StatusInternalServerError, "authentication failed")
+				return
+			}
+		}
+		if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
+			user, serr := s.auth.AuthenticateSession(r.Context(), c.Value)
+			if serr == nil {
+				next(w, r, user.ID)
+				return
+			}
+			if !errors.Is(serr, auth.ErrInvalidCredential) {
+				s.log.Error("authenticate session", "error", serr)
+				s.fail(w, http.StatusInternalServerError, "authentication failed")
+				return
+			}
+		}
+		s.fail(w, http.StatusUnauthorized, "authentication required")
+	}
+}
+
+// loginRequest carries dashboard credentials.
+type loginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	var req loginRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxEnrollBody)).Decode(&req); err != nil {
+		s.fail(w, http.StatusBadRequest, "malformed request")
+		return
+	}
+	token, err := s.auth.Login(r.Context(), req.Email, req.Password)
+	if err != nil {
+		if errors.Is(err, auth.ErrInvalidCredential) {
+			// Identical for an unknown email and a wrong password.
+			s.fail(w, http.StatusUnauthorized, "invalid credentials")
+			return
+		}
+		s.log.Error("login", "error", err)
+		s.fail(w, http.StatusInternalServerError, "login failed")
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   isSecure(r),
+		MaxAge:   int(auth.SessionTTL.Seconds()),
+	})
+	s.respond(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
+		if err := s.auth.Logout(r.Context(), c.Value); err != nil {
+			s.log.Error("logout", "error", err)
+		}
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: sessionCookie, Value: "", Path: "/",
+		HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: isSecure(r), MaxAge: -1,
+	})
+	s.respond(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// isSecure reports whether the request reached us over TLS, directly or via a
+// terminating proxy. The cookie must not be marked Secure over plain HTTP or a
+// local install would silently fail to authenticate.
+func isSecure(r *http.Request) bool {
+	return r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
 }
 
 // respond writes a JSON body.
@@ -195,7 +294,10 @@ func (s *Server) fail(w http.ResponseWriter, status int, message string) {
 // Describe returns a one-line description of the routes, for startup logging.
 func Describe() string {
 	return fmt.Sprintf("routes: %s", strings.Join([]string{
+		"GET /",
 		"GET /healthz",
+		"POST /v1/login",
+		"POST /v1/logout",
 		"POST /v1/devices/enroll",
 		"POST /v1/ingest",
 		"GET /v1/summary",

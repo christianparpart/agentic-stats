@@ -245,3 +245,101 @@ func (s *Service) AuthenticateDevice(ctx context.Context, token string) (Device,
 	}
 	return dev, nil
 }
+
+// User is an authenticated person.
+type User struct {
+	ID    string
+	Email string
+	Role  Role
+}
+
+// SessionTTL is how long a dashboard login stays valid.
+const SessionTTL = 30 * 24 * time.Hour
+
+// Login verifies a password and returns a new session token.
+//
+// The password check runs even when no such user exists, so that a wrong email
+// and a wrong password take the same time and are indistinguishable.
+func (s *Service) Login(ctx context.Context, email, password string) (string, error) {
+	var userID, hash string
+	err := s.db.InAuthTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			`SELECT id::text, password_hash FROM users WHERE email = $1`, email).Scan(&userID, &hash)
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Spend the same work as a real verification before failing.
+			_ = VerifyPassword(decoyHash, password)
+			return "", ErrInvalidCredential
+		}
+		return "", fmt.Errorf("auth: look up user: %w", err)
+	}
+	if err := VerifyPassword(hash, password); err != nil {
+		return "", ErrInvalidCredential
+	}
+
+	token, err := newSecret(32)
+	if err != nil {
+		return "", err
+	}
+	err = s.db.InTenantTx(ctx, userID, func(ctx context.Context, tx pgx.Tx) error {
+		_, xerr := tx.Exec(ctx, `
+			INSERT INTO sessions (token_hash, user_id, expires_at)
+			VALUES ($1, $2::uuid, now() + $3::interval)`,
+			hashSecret(token), userID, SessionTTL.String())
+		return xerr
+	})
+	if err != nil {
+		return "", fmt.Errorf("auth: create session: %w", err)
+	}
+	return token, nil
+}
+
+// decoyHash is a real argon2id hash of an unguessable value, used to equalize
+// timing when the email does not exist.
+var decoyHash = mustHash("a-value-no-one-will-submit")
+
+func mustHash(v string) string {
+	h, err := HashPassword(v)
+	if err != nil {
+		panic("auth: cannot hash decoy: " + err.Error())
+	}
+	return h
+}
+
+// AuthenticateSession resolves a session token to its user.
+func (s *Service) AuthenticateSession(ctx context.Context, token string) (User, error) {
+	var u User
+	var role string
+	err := s.db.InAuthTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			UPDATE sessions sess
+			   SET last_used = now()
+			  FROM users u
+			 WHERE sess.token_hash = $1
+			   AND sess.expires_at > now()
+			   AND u.id = sess.user_id
+			RETURNING u.id::text, u.email, u.role`,
+			hashSecret(token)).Scan(&u.ID, &u.Email, &role)
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return User{}, ErrInvalidCredential
+		}
+		return User{}, fmt.Errorf("auth: authenticate session: %w", err)
+	}
+	u.Role = Role(role)
+	return u, nil
+}
+
+// Logout invalidates a session token.
+func (s *Service) Logout(ctx context.Context, token string) error {
+	err := s.db.InAuthTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		_, xerr := tx.Exec(ctx, `DELETE FROM sessions WHERE token_hash = $1`, hashSecret(token))
+		return xerr
+	})
+	if err != nil {
+		return fmt.Errorf("auth: logout: %w", err)
+	}
+	return nil
+}

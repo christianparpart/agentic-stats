@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -216,4 +217,138 @@ func TestFullHTTPRoundTrip(t *testing.T) {
 	if summary.TotalCostUSD <= 0 {
 		t.Errorf("cost = %v, want positive", summary.TotalCostUSD)
 	}
+}
+
+func TestDashboardIsServedAtRoot(t *testing.T) {
+	db := storetest.Open(t)
+	ts := newTestServer(t, db)
+
+	resp := doRequest(t, ts, http.MethodGet, "/", "", nil)
+	defer func() { _ = resp.Body.Close() }() // test cleanup
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Errorf("content type = %q, want text/html", ct)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	// The page must be self-contained: nothing fetched over the network at
+	// render time. Checked by looking for resource loads specifically -- a bare
+	// "http" also matches the SVG namespace URI, which is an identifier rather
+	// than a fetch.
+	for _, forbidden := range []string{
+		`src="http`, `src='http`, `href="http`, `href='http`,
+		"<script src", "<link rel=\"stylesheet\"", "@import",
+	} {
+		if bytes.Contains(body, []byte(forbidden)) {
+			t.Errorf("dashboard loads an external resource (%q); it must be self-contained", forbidden)
+		}
+	}
+	if resp.Header.Get("Content-Security-Policy") == "" {
+		t.Error("dashboard must ship a Content-Security-Policy")
+	}
+}
+
+func TestUnknownPathIsNotFound(t *testing.T) {
+	db := storetest.Open(t)
+	ts := newTestServer(t, db)
+
+	resp := doRequest(t, ts, http.MethodGet, "/no/such/page", "", nil)
+	defer func() { _ = resp.Body.Close() }() // test cleanup
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+// The dashboard authenticates with a cookie rather than a device token, so the
+// read endpoints must accept both without ingest accepting either.
+func TestBrowserSessionCanReadButNotIngest(t *testing.T) {
+	db := storetest.Open(t)
+	ts := newTestServer(t, db)
+	ctx := context.Background()
+
+	authSvc, err := auth.NewService(db)
+	if err != nil {
+		t.Fatalf("auth.NewService: %v", err)
+	}
+	const password = "a-sufficiently-long-password"
+	if _, err := authSvc.CreateUser(ctx, "browser@example.invalid", password, auth.RoleUser); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	login := func(pw string) *http.Response {
+		body, err := json.Marshal(map[string]string{"email": "browser@example.invalid", "password": pw})
+		if err != nil {
+			t.Fatalf("marshal login: %v", err)
+		}
+		return doRequest(t, ts, http.MethodPost, "/v1/login", "", bytes.NewReader(body))
+	}
+
+	// A wrong password is rejected, and reveals nothing about which half failed.
+	bad := login("not-the-password")
+	if bad.StatusCode != http.StatusUnauthorized {
+		t.Errorf("wrong password: status = %d, want 401", bad.StatusCode)
+	}
+	_ = bad.Body.Close()
+
+	good := login(password)
+	if good.StatusCode != http.StatusOK {
+		t.Fatalf("login: status = %d, want 200", good.StatusCode)
+	}
+	var cookie *http.Cookie
+	for _, c := range good.Cookies() {
+		if c.Name == "agentic_session" {
+			cookie = c
+		}
+	}
+	_ = good.Body.Close()
+	if cookie == nil {
+		t.Fatal("login set no session cookie")
+	}
+	if !cookie.HttpOnly {
+		t.Error("session cookie must be HttpOnly so script cannot read it")
+	}
+	if cookie.SameSite != http.SameSiteLaxMode {
+		t.Errorf("session cookie SameSite = %v, want Lax", cookie.SameSite)
+	}
+
+	withCookie := func(method, path string) *http.Response {
+		req, err := http.NewRequestWithContext(ctx, method, ts.URL+path, http.NoBody)
+		if err != nil {
+			t.Fatalf("build %s: %v", path, err)
+		}
+		req.AddCookie(cookie)
+		resp, err := ts.Client().Do(req)
+		if err != nil {
+			t.Fatalf("do %s: %v", path, err)
+		}
+		return resp
+	}
+
+	for _, path := range []string{"/v1/summary", "/v1/daily"} {
+		resp := withCookie(http.MethodGet, path)
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("GET %s with a session: status = %d, want 200", path, resp.StatusCode)
+		}
+		_ = resp.Body.Close()
+	}
+
+	// Writing into the archive stays device-only.
+	ingestResp := withCookie(http.MethodPost, "/v1/ingest")
+	if ingestResp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("ingest with a browser session: status = %d, want 401", ingestResp.StatusCode)
+	}
+	_ = ingestResp.Body.Close()
+
+	// Logging out invalidates the cookie immediately.
+	logout := withCookie(http.MethodPost, "/v1/logout")
+	_ = logout.Body.Close()
+	after := withCookie(http.MethodGet, "/v1/summary")
+	if after.StatusCode != http.StatusUnauthorized {
+		t.Errorf("after logout: status = %d, want 401", after.StatusCode)
+	}
+	_ = after.Body.Close()
 }
