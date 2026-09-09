@@ -2,14 +2,15 @@
 
 [![CI](https://github.com/christianparpart/agentic-stats/actions/workflows/ci.yml/badge.svg)](https://github.com/christianparpart/agentic-stats/actions/workflows/ci.yml)
 
-Fleet-wide analytics and a durable archive for AI coding assistants.
+A peer-to-peer archive and analytics for AI coding assistants.
 
 You use Claude Code on a laptop, a desktop and a couple of VMs. Each machine keeps a
 detailed record of that work — token counts, models, git branches, every file edit as a
 unified diff, tool timings — **locally, and only for about 30 days.** Then it is deleted.
 
-`agentic-stats` runs a small daemon on each machine that ships those logs to a server you
-control, so the history survives, and gives you a dashboard over the whole fleet.
+`agentic-stats` runs one daemon on each machine. Daemons find each other on any network they
+share, authenticate from a shared key, and sync both ways until **every machine holds
+everything**. There is no server. Each node serves its own dashboard.
 
 ## Why
 
@@ -24,9 +25,10 @@ control, so the history survives, and gives you a dashboard over the whole fleet
 
 ## What you get
 
-- **A durable archive.** Raw transcript lines, stored verbatim. Every derived table is a
-  cache that can be dropped and rebuilt, so metrics invented years from now still apply to
-  today's data.
+- **A durable archive, replicated.** Raw transcript lines, stored verbatim on every node.
+  The more machines you have, the safer the data — losing one loses nothing.
+- **Encrypted at rest.** Record bodies are sealed with a key derived from your mesh key, so
+  a stolen laptop or a copied database yields nothing.
 - **Cost.** API-equivalent cost from real token counts against a versioned price table,
   including the cache-read/cache-write split — and what prompt caching actually saved you.
 - **Time.** Active coding time, busy hours, busy days, streaks, trends by day/week/month/year.
@@ -34,41 +36,40 @@ control, so the history survives, and gives you a dashboard over the whole fleet
 - **Delivery.** Sessions joined to pull requests and issues: cost per merged PR, lead time,
   AI-written lines versus total.
 - **Fleet health.** Which machines are reporting, and whether the archive has gaps.
+- **No account system.** You join a mesh by holding its key. That is the whole membership
+  model.
 
 ## Status
 
-Working end to end: the collector discovers transcripts, ships them to the server, and the
-server stores, summarises and displays them. The dashboard is served at `/` from the server
-binary -- one file, nothing to deploy alongside it.
+A single node works end to end: collect, store sealed, derive, and serve a dashboard. Peer
+discovery and sync are the next phase; until then, nodes are independent archives.
 
 ## Quickstart
 
-Requires Go and a PostgreSQL 17 you can reach.
+Requires only Go. No database server, no cloud account, no certificates.
 
 ```sh
-# 1. Prepare the database. The application role must NOT be a superuser:
-#    superusers bypass row-level security, which is what isolates tenants.
-./scripts/setup-test-db.sh "postgres://postgres@localhost:5432/agentic_stats?sslmode=disable"
-export AGENTIC_STATS_DATABASE_URL="postgres://agentic_app:agentic_app@localhost:5432/agentic_stats?sslmode=disable"
-
-# 2. Build, create a user, and start the server (migrations run automatically).
 make build
-AGENTIC_STATS_PASSWORD=... ./bin/server create-user --email you@example.com --admin
-./bin/server serve --addr 127.0.0.1:8080
 
-# 3. Enroll this machine and collect.
-./bin/server enroll-code --email you@example.com          # prints a one-time code
-./bin/agent enroll --server http://127.0.0.1:8080 --code <code>
-./bin/agent once                                          # or: ./bin/agent run
+# First machine: generate a mesh key.
+./bin/agentic-stats init          # prints the key -- keep it, there is no recovery
 
-# 4. Open http://127.0.0.1:8080/ and sign in, or read the JSON directly.
-curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/v1/summary
+# Every other machine: adopt the same key.
+./bin/agentic-stats join --key <key>
+
+# Collect and serve.
+./bin/agentic-stats run           # dashboard on http://127.0.0.1:8899
+./bin/agentic-stats once          # or a single pass and exit
+./bin/agentic-stats status        # what this node holds
 ```
 
-The dashboard shows cost, cache savings, the cache hit rate, cost per active day and a
-per-model breakdown. `/v1/summary` and `/v1/daily` return the same figures as JSON, and
-accept either a device token or a browser session -- one API, not two. Ingest stays
-device-only: a browser session can read the archive but never write to it.
+Open the dashboard and sign in with the mesh key. It shows cost, cache savings, the cache
+hit rate, cost per active day and a per-model breakdown; `/v1/summary` and `/v1/daily`
+return the same figures as JSON.
+
+The dashboard binds to loopback by default, where `http://127.0.0.1` is already a secure
+context in every browser -- no certificate to manage and no warning. Binding it elsewhere
+turns on HTTPS with a self-signed certificate.
 
 ## Getting the numbers right
 

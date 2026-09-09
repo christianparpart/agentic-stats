@@ -45,20 +45,6 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:17-alpine
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: agentic_stats
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -66,28 +52,22 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # The integration tests must run as a role that cannot bypass row-level
-      # security. As a superuser they would pass while proving nothing.
-      - name: Prepare test database
-        run: ./scripts/setup-test-db.sh "postgres://postgres:postgres@127.0.0.1:5432/agentic_stats?sslmode=disable"
-
+      # No database service: the archive is embedded SQLite, so the whole
+      # suite runs anywhere. Its predecessor silently skipped every
+      # integration test when no PostgreSQL was reachable.
       - name: Test
-        env:
-          AGENTIC_STATS_TEST_DATABASE_URL: postgres://agentic_app:agentic_app@127.0.0.1:5432/agentic_stats?sslmode=disable
         run: go test -race -coverpkg=./... -coverprofile=coverage.out ./...
 
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -1
 
-      # A skipped integration suite would hide a broken database contract.
-      - name: Assert integration tests actually ran
-        env:
-          AGENTIC_STATS_TEST_DATABASE_URL: postgres://agentic_app:agentic_app@127.0.0.1:5432/agentic_stats?sslmode=disable
+      # Nothing in this suite may quietly skip itself.
+      - name: Assert no test skipped
         run: |
           output="$(go test -count=1 -v ./internal/integration/... 2>&1)"
           echo "$output" | tail -20
           if echo "$output" | grep -q "SKIP"; then
-            echo "::error::integration tests were skipped; the database was not reachable"
+            echo "::error::a test skipped itself; the suite must run everywhere"
             exit 1
           fi
 

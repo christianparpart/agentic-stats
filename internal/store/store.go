@@ -1,134 +1,184 @@
-// Package store owns the Postgres connection and the tenant boundary.
+// Package store is the node's local replica: an embedded SQLite database
+// holding every record this node has collected or received from a peer.
 //
-// Every query that touches tenant data runs inside InTenantTx, which sets the
-// app.user_id that row-level security reads. Queries that must run before a
-// tenant is known -- resolving a bearer token to its owner -- go through
-// InAuthTx, which is deliberately named so that its use stands out in review.
+// There is no tenant column and no row-level security. Membership is the
+// pre-shared key, and one node holds one mesh. What replaces RLS as the
+// at-rest protection is that record bodies arrive here already sealed.
 package store
 
 import (
 	"context"
+	"database/sql"
+	"embed"
 	"errors"
 	"fmt"
+	"io/fs"
+	"sort"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	_ "github.com/ncruces/go-sqlite3/driver"
 )
+
+//go:embed migrations/*.sql
+var migrationFiles embed.FS
 
 // Config is everything a DB needs.
 type Config struct {
-	// URL is the Postgres connection string. Required.
-	URL string
-	// MaxConns bounds the pool. Zero uses the driver default.
-	MaxConns int32
-	// ConnectTimeout bounds the initial connection. Zero selects a default.
-	ConnectTimeout time.Duration
+	// Path is the database file. ":memory:" is accepted for tests.
+	Path string
+	// Clock supplies timestamps. Zero uses the system clock.
+	Clock func() time.Time
 }
 
-// pgxTx is the transaction interface used across this package.
-type pgxTx = pgx.Tx
-
-// DB is a pooled Postgres connection with tenant-aware transaction helpers.
+// DB is the local replica.
 type DB struct {
-	pool *pgxpool.Pool
+	sql    *sql.DB
+	now    func() time.Time
+	origin string
 }
 
-// Open connects to Postgres and verifies the connection.
+// Open connects, applies migrations, and establishes this node's identity.
 func Open(ctx context.Context, cfg Config) (*DB, error) {
-	if cfg.URL == "" {
-		return nil, errors.New("store: Config.URL is required")
+	if cfg.Path == "" {
+		return nil, errors.New("store: Config.Path is required")
 	}
-	poolCfg, err := pgxpool.ParseConfig(cfg.URL)
+	now := cfg.Clock
+	if now == nil {
+		now = func() time.Time { return time.Now().UTC() }
+	}
+
+	// WAL and a real busy timeout are not optional at this write volume.
+	dsn := "file:" + cfg.Path +
+		"?_pragma=journal_mode(WAL)" +
+		"&_pragma=synchronous(NORMAL)" +
+		"&_pragma=busy_timeout(10000)" +
+		"&_pragma=foreign_keys(ON)"
+
+	handle, err := sql.Open("sqlite3", dsn)
 	if err != nil {
-		return nil, fmt.Errorf("store: parse connection string: %w", err)
+		return nil, fmt.Errorf("store: open %s: %w", cfg.Path, err)
 	}
-	if cfg.MaxConns > 0 {
-		poolCfg.MaxConns = cfg.MaxConns
+	if err := handle.PingContext(ctx); err != nil {
+		return nil, errors.Join(fmt.Errorf("store: ping %s: %w", cfg.Path, err), handle.Close())
 	}
 
-	timeout := cfg.ConnectTimeout
-	if timeout <= 0 {
-		timeout = 10 * time.Second
+	db := &DB{sql: handle, now: now}
+	if err := db.migrate(ctx); err != nil {
+		return nil, errors.Join(err, handle.Close())
 	}
-	connectCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	pool, err := pgxpool.NewWithConfig(connectCtx, poolCfg)
-	if err != nil {
-		return nil, fmt.Errorf("store: connect: %w", err)
+	if err := db.loadOrMintIdentity(ctx); err != nil {
+		return nil, errors.Join(err, handle.Close())
 	}
-	if err := pool.Ping(connectCtx); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("store: ping: %w", err)
-	}
-	return &DB{pool: pool}, nil
+	return db, nil
 }
 
-// Close releases the pool.
-func (db *DB) Close() { db.pool.Close() }
+// Close releases the database.
+func (db *DB) Close() error {
+	if err := db.sql.Close(); err != nil {
+		return fmt.Errorf("store: close: %w", err)
+	}
+	return nil
+}
 
-// Pool exposes the underlying pool for migrations and health checks.
-func (db *DB) Pool() *pgxpool.Pool { return db.pool }
+// OriginID is this node's replication identity.
+func (db *DB) OriginID() string { return db.origin }
 
-// InTenantTx runs fn in a transaction scoped to one user.
+// SQL exposes the handle for read-only queries in derive.
+func (db *DB) SQL() *sql.DB { return db.sql }
+
+// Now returns the configured clock's time.
+func (db *DB) Now() time.Time { return db.now() }
+
+// inTx runs fn in a transaction, rolling back on error or panic.
 //
-// It sets app.user_id with SET LOCAL, so the setting is bound to the
-// transaction and cannot leak to the next borrower of the pooled connection.
-// Row-level security reads that setting; a query that escapes this helper sees
-// no rows rather than every tenant's rows.
-func (db *DB) InTenantTx(ctx context.Context, userID string, fn func(context.Context, pgx.Tx) error) error {
-	if userID == "" {
-		return errors.New("store: InTenantTx requires a user id")
-	}
-	return db.inTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, "SELECT set_config('app.user_id', $1, true)", userID); err != nil {
-			return fmt.Errorf("store: establish tenant: %w", err)
-		}
-		return fn(ctx, tx)
-	})
-}
-
-// InAuthTx runs fn without a tenant established.
-//
-// Reserved for resolving a credential to its owner, which by definition cannot
-// know the tenant beforehand. Everything else belongs in InTenantTx.
-func (db *DB) InAuthTx(ctx context.Context, fn func(context.Context, pgx.Tx) error) error {
-	return db.inTx(ctx, fn)
-}
-
-// inTx wraps fn in a transaction, rolling back on error or panic.
-func (db *DB) inTx(ctx context.Context, fn func(context.Context, pgx.Tx) error) (err error) {
-	tx, err := db.pool.Begin(ctx)
+// Lifted from the previous Postgres store: the discipline is identical and was
+// already correct.
+func (db *DB) inTx(ctx context.Context, fn func(context.Context, *sql.Tx) error) (err error) {
+	tx, err := db.sql.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("store: begin: %w", err)
 	}
 	defer func() {
 		if p := recover(); p != nil {
-			// Roll back before re-panicking so the connection is not returned
-			// to the pool mid-transaction.
-			_ = tx.Rollback(ctx)
+			// Roll back before re-panicking so the connection is not left
+			// mid-transaction.
+			_ = tx.Rollback()
 			panic(p)
 		}
 		if err != nil {
-			err = errors.Join(err, ignoreTxClosed(tx.Rollback(ctx)))
+			err = errors.Join(err, ignoreTxDone(tx.Rollback()))
 		}
 	}()
 
 	if err = fn(ctx, tx); err != nil {
 		return err
 	}
-	if err = tx.Commit(ctx); err != nil {
+	if err = tx.Commit(); err != nil {
 		return fmt.Errorf("store: commit: %w", err)
 	}
 	return nil
 }
 
-// ignoreTxClosed drops the benign error from rolling back an already-finished
-// transaction, so it does not mask the real failure.
-func ignoreTxClosed(err error) error {
-	if err == nil || errors.Is(err, pgx.ErrTxClosed) {
+// ignoreTxDone drops the benign error from rolling back a finished
+// transaction, so it cannot mask the real failure.
+func ignoreTxDone(err error) error {
+	if err == nil || errors.Is(err, sql.ErrTxDone) {
 		return nil
 	}
 	return err
+}
+
+// migrate applies every migration not yet recorded, in filename order.
+func (db *DB) migrate(ctx context.Context) error {
+	_, err := db.sql.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			name       TEXT PRIMARY KEY,
+			applied_at TEXT NOT NULL
+		)`)
+	if err != nil {
+		return fmt.Errorf("store: create migration table: %w", err)
+	}
+
+	entries, err := fs.ReadDir(migrationFiles, "migrations")
+	if err != nil {
+		return fmt.Errorf("store: list migrations: %w", err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		var applied int
+		row := db.sql.QueryRowContext(ctx,
+			`SELECT count(*) FROM schema_migrations WHERE name = ?`, name)
+		if err := row.Scan(&applied); err != nil {
+			return fmt.Errorf("store: check migration %s: %w", name, err)
+		}
+		if applied > 0 {
+			continue
+		}
+		body, err := migrationFiles.ReadFile("migrations/" + name)
+		if err != nil {
+			return fmt.Errorf("store: read migration %s: %w", name, err)
+		}
+		// The migration and its record commit together, so a failure part-way
+		// leaves neither the change nor the claim that it was applied.
+		err = db.inTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
+			if _, err := tx.ExecContext(ctx, string(body)); err != nil {
+				return fmt.Errorf("store: apply migration %s: %w", name, err)
+			}
+			_, err := tx.ExecContext(ctx,
+				`INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)`,
+				name, db.now().Format(time.RFC3339Nano))
+			return err
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }

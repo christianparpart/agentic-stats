@@ -1,7 +1,8 @@
 # agentic-stats — project guidelines
 
-Collects AI coding-assistant transcripts from every machine you work on and ships them to a
-server you control, before local retention deletes them.
+A peer-to-peer archive of AI coding-assistant transcripts. One daemon per machine; no
+server. Machines find each other, authenticate from a shared key, and sync both ways until
+every node holds everything.
 
 **Precedence, highest first:**
 
@@ -100,7 +101,8 @@ This project is unusually well suited to it, and the design already depends on i
 |---|---|
 | A new transcript format | a `Parser` registered in `derive`'s registry |
 | A new assistant to collect from | a `Source` implementation registered in `source` |
-| A new model's pricing | a row in `prices.yaml` |
+| A new model's pricing | a row in `prices.toml` |
+| A new external storage backend | a `Backend` implementation |
 | A new branch→issue convention | a pattern in config |
 
 When in doubt: *if a sixth case showed up tomorrow, how many places would I edit?* More than
@@ -171,36 +173,33 @@ that is a design smell — inject the dependency, extract the decision.
 Layered bottom-up. **Lower layers must not import higher ones.**
 
 ```
-cmd/agent/            collector daemon — wiring only, no logic
-cmd/server/           ingest API + embedded dashboard — wiring only, no logic
+cmd/agentic-stats/    the only binary -- wiring only, no logic
 internal/
   source/             adapter interface: discovers append-only streams.
                       Knows nothing about what the lines mean.
     claudecode/       Claude Code JSONL roots, incl. subagents and desktop
-    claudemeta/       history.jsonl, plan-usage-history, config metadata
-  cursor/             durable tail position + outbox. No knowledge of formats.
-  wire/               envelope, batching, compression, retry. No knowledge of formats.
-  redact/             secret scrubbing. Runs before anything leaves the machine.
-  auth/               users, invites, sessions, device tokens
-  store/              Postgres, migrations, RLS transaction helpers
-  ingest/             raw-line intake and dedupe. Stores; does not interpret.
-  derive/             raw lines → facts. THE ONLY place that interprets a transcript.
+    sourcetest/       in-memory FileSystem for tests
+  cursor/             durable tail positions. No knowledge of formats.
+  wire/               record shape, gzip-NDJSON codec. No knowledge of formats.
+  seal/               THE ONLY place the pre-shared key is used
+  store/              the local replica: SQLite, sequences, fork detection
+  ingest/             the local write path: seal, extract, append
+  derive/             raw lines -> facts. THE ONLY place a transcript is interpreted.
   pricing/            price tables, model-id normalization
-  correlate/          VCS and tracker joins
-  rollup/             materialized aggregates
-  api/                HTTP handlers
-web/                  React SPA, embedded into the server binary
+  api/                dashboard and read API
+    assets/           the dashboard, embedded
 ```
 
-**Rules that follow from the layering:**
+**Rules that follow from the layering, and are enforced by `.golangci.yml`:**
 
-- `source`, `cursor` and `wire` must not import `derive`. The agent ships bytes; it does not
-  understand them. This is what lets collection keep working when the format changes.
+- `source`, `cursor` and `wire` must not import `derive`, `store` or `ingest`. Collection
+  ships bytes; it does not understand them. This is what lets collection keep working when
+  the transcript format changes.
+- **Only `ingest`, `api` and the mesh may import `seal`.** A grep for the pre-shared key
+  outside `seal` should find nothing. Everything else asks for a key or hands over a
+  plaintext.
 - `derive` is the single place transcript semantics live. The `requestId` fold happens there,
   once.
-- Nothing outside `redact` decides what is safe to transmit.
-
----
 
 ## Workflow
 
@@ -217,13 +216,23 @@ web/                  React SPA, embedded into the server binary
 Violating any of these is a correctness bug, not a style issue:
 
 1. **Fold assistant lines by `requestId` before summing usage.** The same `usage` object is
-   repeated on every content block; naive summing inflates output tokens ~2.9× and thinking
-   tokens ~4.2×, by a factor that differs per metric. The `request_usage` uniqueness
-   constraint enforces this — do not work around it.
-2. **Raw lines are the source of truth.** Every derived table must be droppable and
-   rebuildable. Never write a fact that cannot be recomputed from `raw_lines`.
+   repeated on every content block; naive summing inflates output tokens ~2.9x and thinking
+   tokens ~4.2x, by a factor that differs per metric. Ties in the fold must be impossible,
+   not merely unlikely: two nodes running the same query must return the same row, or
+   replicas that agree will look like they diverge.
+2. **Raw lines are the source of truth.** Every extracted column must be recomputable from
+   the sealed body. Never write a fact that cannot be re-derived.
 3. **Parsers accumulate, never replaced.** Deleting an old parser breaks re-derivation of
    every year it covered.
 4. **Unrecognized input is stored, never dropped.** A format we cannot parse yet costs
    nothing permanently; one we failed to store is gone.
-5. **Tenant isolation is enforced by RLS**, not by remembering a `WHERE` clause.
+5. **Sequence numbers are gap-free**, allocated inside the same transaction as the insert.
+   Anti-entropy asks for "everything after my watermark", which is only correct without
+   holes. Never keep the counter in memory or in a separate row.
+6. **A watermark advances only in the transaction that commits the records it covers.**
+   Advance-then-crash loses data permanently and invisibly.
+7. **A conflicting `(origin_id, seq)` is quarantined, never merged and never discarded.** It
+   is proof that two machines share an origin id, and the alternative is silent data loss
+   that reports itself as healthy convergence.
+8. **Nothing is written to the archive unsealed.** The database file must never contain
+   transcript bodies in the clear -- there is a test that greps for exactly that.

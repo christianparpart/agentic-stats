@@ -1,53 +1,84 @@
-// Package api exposes the server's HTTP surface.
+// Package api is the dashboard and read API each node serves for itself.
 //
-// Every endpoint but health requires a device token, and the tenant is always
-// taken from that token server-side. A user id in a request body is never
-// trusted.
+// There are no accounts. The pre-shared key that admits a node to the mesh is
+// also the dashboard password, so anyone who can read the archive over the
+// network already holds the key that decrypts it.
 package api
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
-	"github.com/christianparpart/agentic-stats/internal/auth"
 	"github.com/christianparpart/agentic-stats/internal/derive"
-	"github.com/christianparpart/agentic-stats/internal/ingest"
-	"github.com/christianparpart/agentic-stats/internal/wire"
+	"github.com/christianparpart/agentic-stats/internal/seal"
 )
 
-// maxEnrollBody bounds the enrollment request, which is small by construction.
-const maxEnrollBody = 64 << 10
+// maxLoginBody bounds the login request, which is small by construction.
+const maxLoginBody = 64 << 10
+
+// sessionCookie is the dashboard's session cookie name.
+const sessionCookie = "agentic_session"
+
+// sessionTTL is how long a dashboard login lasts. Sessions live in memory, so
+// a daemon restart signs you out — acceptable for a local dashboard, and it
+// means no session state to replicate between peers.
+const sessionTTL = 12 * time.Hour
+
+// loginDelay is applied to every failed login, so guessing the PSK over the
+// network is rate-limited by wall clock rather than by CPU.
+const loginDelay = 500 * time.Millisecond
 
 // Config is everything the API needs.
 type Config struct {
-	Auth   *auth.Service
-	Ingest *ingest.Service
 	Derive *derive.Service
+	Keys   *seal.Keys
 	Logger *slog.Logger
+	// Now supplies time. Zero uses the system clock.
+	Now func() time.Time
 }
 
 // Server routes and handles HTTP requests.
 type Server struct {
-	auth   *auth.Service
-	ingest *ingest.Service
 	derive *derive.Service
+	keys   *seal.Keys
 	log    *slog.Logger
+	now    func() time.Time
+
+	mu       sync.Mutex
+	sessions map[string]time.Time
 }
 
 // NewServer returns a Server wired to the supplied services.
 func NewServer(cfg Config) (*Server, error) {
-	if cfg.Auth == nil || cfg.Ingest == nil || cfg.Derive == nil {
-		return nil, errors.New("api: Auth, Ingest and Derive services are all required")
+	if cfg.Derive == nil {
+		return nil, errors.New("api: a derive service is required")
+	}
+	if cfg.Keys == nil {
+		return nil, errors.New("api: keys are required")
 	}
 	log := cfg.Logger
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &Server{auth: cfg.Auth, ingest: cfg.Ingest, derive: cfg.Derive, log: log}, nil
+	now := cfg.Now
+	if now == nil {
+		now = func() time.Time { return time.Now().UTC() }
+	}
+	return &Server{
+		derive:   cfg.Derive,
+		keys:     cfg.Keys,
+		log:      log,
+		now:      now,
+		sessions: make(map[string]time.Time),
+	}, nil
 }
 
 // Handler builds the HTTP routes.
@@ -57,190 +88,74 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("POST /v1/login", s.handleLogin)
 	mux.HandleFunc("POST /v1/logout", s.handleLogout)
-	mux.HandleFunc("POST /v1/devices/enroll", s.handleEnroll)
-	// Ingest is device-only: a browser session must never be able to write
-	// into the archive.
-	mux.HandleFunc("POST /v1/ingest", s.withDevice(s.handleIngest))
-	// Reads accept either a device token or a dashboard session.
-	mux.HandleFunc("GET /v1/summary", s.withTenant(s.handleSummary))
-	mux.HandleFunc("GET /v1/daily", s.withTenant(s.handleDaily))
+	mux.HandleFunc("GET /v1/summary", s.authenticated(s.handleSummary))
+	mux.HandleFunc("GET /v1/daily", s.authenticated(s.handleDaily))
 	return mux
 }
 
-// deviceHandler is a handler that runs with an authenticated device.
-type deviceHandler func(http.ResponseWriter, *http.Request, auth.Device)
-
-// withDevice authenticates the bearer token and establishes the tenant.
-func (s *Server) withDevice(next deviceHandler) http.HandlerFunc {
+// authenticated gates a handler on a valid dashboard session.
+func (s *Server) authenticated(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		token := bearerToken(r)
-		if token == "" {
-			s.fail(w, http.StatusUnauthorized, "missing bearer token")
+		c, err := r.Cookie(sessionCookie)
+		if err != nil || c.Value == "" || !s.validSession(c.Value) {
+			s.fail(w, http.StatusUnauthorized, "authentication required")
 			return
 		}
-		dev, err := s.auth.AuthenticateDevice(r.Context(), token)
-		if err != nil {
-			if errors.Is(err, auth.ErrInvalidCredential) {
-				s.fail(w, http.StatusUnauthorized, "invalid device token")
-				return
-			}
-			s.log.Error("authenticate device", "error", err)
-			s.fail(w, http.StatusInternalServerError, "authentication failed")
-			return
-		}
-		next(w, r, dev)
+		next(w, r)
 	}
 }
 
-// bearerToken extracts a bearer credential from the Authorization header.
-func bearerToken(r *http.Request) string {
-	const prefix = "Bearer "
-	h := r.Header.Get("Authorization")
-	if !strings.HasPrefix(h, prefix) {
-		return ""
+// validSession reports whether a session token is live, expiring it if not.
+func (s *Server) validSession(token string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	expiry, ok := s.sessions[token]
+	if !ok {
+		return false
 	}
-	return strings.TrimSpace(h[len(prefix):])
+	if s.now().After(expiry) {
+		delete(s.sessions, token)
+		return false
+	}
+	return true
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	s.respond(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// enrollRequest redeems a one-time code for a durable device token.
-type enrollRequest struct {
-	Code   string      `json:"code"`
-	Device wire.Device `json:"device"`
-}
-
-type enrollResponse struct {
-	Token string `json:"token"`
-}
-
-func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
-	var req enrollRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxEnrollBody)).Decode(&req); err != nil {
-		s.fail(w, http.StatusBadRequest, "malformed request")
-		return
-	}
-	token, err := s.auth.RedeemEnrollment(r.Context(), req.Code, req.Device)
-	if err != nil {
-		if errors.Is(err, auth.ErrInvalidCredential) {
-			// Deliberately identical for expired, redeemed and unknown codes.
-			s.fail(w, http.StatusUnauthorized, "invalid or expired enrollment code")
-			return
-		}
-		s.log.Error("redeem enrollment", "error", err)
-		s.fail(w, http.StatusInternalServerError, "enrollment failed")
-		return
-	}
-	s.respond(w, http.StatusOK, enrollResponse{Token: token})
-}
-
-func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request, dev auth.Device) {
-	var records []wire.Record
-	header, err := wire.DecodeBatch(r.Body, func(rec wire.Record) error {
-		records = append(records, rec)
-		return nil
-	})
-	if err != nil {
-		s.log.Warn("decode batch", "device", dev.Hostname, "error", err)
-		s.fail(w, http.StatusBadRequest, "malformed batch")
-		return
-	}
-
-	result, err := s.ingest.Store(r.Context(), dev, header, records)
-	if err != nil {
-		s.log.Error("store batch", "device", dev.Hostname, "error", err)
-		s.fail(w, http.StatusInternalServerError, "ingest failed")
-		return
-	}
-	s.log.Info("ingested",
-		"device", dev.Hostname,
-		"received", result.Received, "stored", result.Stored, "duplicates", result.Duplicates)
-	s.respond(w, http.StatusOK, result)
-}
-
-func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request, userID string) {
-	summary, err := s.derive.Summarize(r.Context(), userID)
-	if err != nil {
-		s.log.Error("summarize", "error", err)
-		s.fail(w, http.StatusInternalServerError, "summary failed")
-		return
-	}
-	s.respond(w, http.StatusOK, summary)
-}
-
-func (s *Server) handleDaily(w http.ResponseWriter, r *http.Request, userID string) {
-	days, err := s.derive.Daily(r.Context(), userID)
-	if err != nil {
-		s.log.Error("daily", "error", err)
-		s.fail(w, http.StatusInternalServerError, "daily failed")
-		return
-	}
-	s.respond(w, http.StatusOK, map[string]any{"days": days})
-}
-
-// sessionCookie is the dashboard's session cookie name.
-const sessionCookie = "agentic_session"
-
-// tenantHandler is a handler that runs with a resolved tenant.
-type tenantHandler func(http.ResponseWriter, *http.Request, string)
-
-// withTenant resolves the tenant from either a device token or a dashboard
-// session, so the dashboard and the collector share one set of read endpoints.
-func (s *Server) withTenant(next tenantHandler) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if token := bearerToken(r); token != "" {
-			dev, err := s.auth.AuthenticateDevice(r.Context(), token)
-			if err == nil {
-				next(w, r, dev.UserID)
-				return
-			}
-			if !errors.Is(err, auth.ErrInvalidCredential) {
-				s.log.Error("authenticate device", "error", err)
-				s.fail(w, http.StatusInternalServerError, "authentication failed")
-				return
-			}
-		}
-		if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
-			user, serr := s.auth.AuthenticateSession(r.Context(), c.Value)
-			if serr == nil {
-				next(w, r, user.ID)
-				return
-			}
-			if !errors.Is(serr, auth.ErrInvalidCredential) {
-				s.log.Error("authenticate session", "error", serr)
-				s.fail(w, http.StatusInternalServerError, "authentication failed")
-				return
-			}
-		}
-		s.fail(w, http.StatusUnauthorized, "authentication required")
-	}
-}
-
-// loginRequest carries dashboard credentials.
+// loginRequest carries the pre-shared key.
 type loginRequest struct {
-	Email    string `json:"email"`
 	Password string `json:"password"`
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var req loginRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxEnrollBody)).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxLoginBody)).Decode(&req); err != nil {
 		s.fail(w, http.StatusBadRequest, "malformed request")
 		return
 	}
-	token, err := s.auth.Login(r.Context(), req.Email, req.Password)
+
+	// Derive the offered secret and compare the resulting key rather than the
+	// text, so the comparison is fixed-width and constant-time regardless of
+	// how long a guess is.
+	offered, err := seal.Derive(req.Password)
+	if err != nil || !seal.Equal(offered.DashboardKey(), s.keys.DashboardKey()) {
+		time.Sleep(loginDelay)
+		s.fail(w, http.StatusUnauthorized, "invalid key")
+		return
+	}
+
+	token, err := newSessionToken()
 	if err != nil {
-		if errors.Is(err, auth.ErrInvalidCredential) {
-			// Identical for an unknown email and a wrong password.
-			s.fail(w, http.StatusUnauthorized, "invalid credentials")
-			return
-		}
-		s.log.Error("login", "error", err)
+		s.log.Error("mint session", "error", err)
 		s.fail(w, http.StatusInternalServerError, "login failed")
 		return
 	}
+	s.mu.Lock()
+	s.sessions[token] = s.now().Add(sessionTTL)
+	s.mu.Unlock()
+
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookie,
 		Value:    token,
@@ -248,16 +163,16 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 		Secure:   isSecure(r),
-		MaxAge:   int(auth.SessionTTL.Seconds()),
+		MaxAge:   int(sessionTTL.Seconds()),
 	})
 	s.respond(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
-		if err := s.auth.Logout(r.Context(), c.Value); err != nil {
-			s.log.Error("logout", "error", err)
-		}
+		s.mu.Lock()
+		delete(s.sessions, c.Value)
+		s.mu.Unlock()
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookie, Value: "", Path: "/",
@@ -266,9 +181,38 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	s.respond(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
+	summary, err := s.derive.Summarize(r.Context())
+	if err != nil {
+		s.log.Error("summarize", "error", err)
+		s.fail(w, http.StatusInternalServerError, "summary failed")
+		return
+	}
+	s.respond(w, http.StatusOK, summary)
+}
+
+func (s *Server) handleDaily(w http.ResponseWriter, r *http.Request) {
+	days, err := s.derive.Daily(r.Context())
+	if err != nil {
+		s.log.Error("daily", "error", err)
+		s.fail(w, http.StatusInternalServerError, "daily failed")
+		return
+	}
+	s.respond(w, http.StatusOK, map[string]any{"days": days})
+}
+
+// newSessionToken returns an unguessable session identifier.
+func newSessionToken() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("api: generate session token: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
 // isSecure reports whether the request reached us over TLS, directly or via a
-// terminating proxy. The cookie must not be marked Secure over plain HTTP or a
-// local install would silently fail to authenticate.
+// terminating proxy. The cookie must not be marked Secure over plain HTTP or
+// the loopback dashboard would silently fail to authenticate.
 func isSecure(r *http.Request) bool {
 	return r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
 }
@@ -283,24 +227,15 @@ func (s *Server) respond(w http.ResponseWriter, status int, body any) {
 	}
 }
 
-// fail writes a JSON error body.
-//
-// Messages are intentionally coarse: the server must not help an attacker
-// distinguish an unknown credential from an expired one.
+// fail writes a JSON error body. Messages stay coarse deliberately.
 func (s *Server) fail(w http.ResponseWriter, status int, message string) {
 	s.respond(w, status, map[string]string{"error": message})
 }
 
 // Describe returns a one-line description of the routes, for startup logging.
 func Describe() string {
-	return fmt.Sprintf("routes: %s", strings.Join([]string{
-		"GET /",
-		"GET /healthz",
-		"POST /v1/login",
-		"POST /v1/logout",
-		"POST /v1/devices/enroll",
-		"POST /v1/ingest",
-		"GET /v1/summary",
-		"GET /v1/daily",
-	}, ", "))
+	return "routes: " + strings.Join([]string{
+		"GET /", "GET /healthz", "POST /v1/login", "POST /v1/logout",
+		"GET /v1/summary", "GET /v1/daily",
+	}, ", ")
 }

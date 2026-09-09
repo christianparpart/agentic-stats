@@ -156,11 +156,9 @@
 <section id="login" class="login hidden">
   <div class="card">
     <h2>agentic-stats</h2>
-    <p class="cap">Sign in to view your archive.</p>
+    <p class="cap">Enter the mesh key to view this node's archive.</p>
     <form id="login-form">
-      <label for="email">Email</label>
-      <input id="email" type="email" autocomplete="username" required>
-      <label for="password">Password</label>
+      <label for="password">Mesh key</label>
       <input id="password" type="password" autocomplete="current-password" required>
       <button class="primary" type="submit">Sign in</button>
       <div class="err" id="login-err"></div>
@@ -383,14 +381,11 @@ document.getElementById("login-form").addEventListener("submit", async e => {
     await api("/v1/login", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({
-        email: document.getElementById("email").value,
-        password: document.getElementById("password").value,
-      }),
+      body: JSON.stringify({password: document.getElementById("password").value}),
     });
     await load();
   } catch (_) {
-    err.textContent = "Those credentials were not accepted.";
+    err.textContent = "That key was not accepted.";
   }
 });
 

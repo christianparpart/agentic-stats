@@ -3,7 +3,7 @@
 ## Goals
 
 1. **Preserve.** Assistant transcripts are deleted locally on a rolling retention window
-   (Claude Code defaults to 30 days). Get them to durable storage before that happens.
+   (Claude Code defaults to 30 days). Get them somewhere durable before that happens.
 2. **Aggregate.** One view across every machine.
 3. **Explain.** Cost, time, projects, and delivery outcomes.
 
@@ -12,20 +12,26 @@ one next month, because the data it would have collected no longer exists.
 
 ## Shape
 
+Every node is the same program. There is no server and no special role.
+
 ```
-each machine                          server
-┌──────────────────────────┐         ┌────────────────────────────────┐
-│ agent                    │         │ server                         │
-│  source adapters ────┐   │  HTTPS  │  ingest API ──► Postgres (RLS) │
-│  cursor store (bbolt)│──────────►  │  derive     ──► rollups        │
-│  outbox (durable)    │   │ NDJSON  │  VCS / tracker sync workers    │
-└──────────────────────────┘  +gzip  │  embedded SPA                  │
-   device token ──────────────────►  │  users / devices / invites     │
-                                      └────────────────────────────────┘
+   ┌────────────── node ──────────────┐        ┌───── node ─────┐
+   │ collect  source adapters         │        │ collect …      │
+   │ store    SQLite, bodies sealed   │◄──────►│ store …        │
+   │ mesh     beacon · dial · sync    │  TLS   │ mesh …         │
+   │ serve    dashboard               │  +PSK  │ serve …        │
+   └──────────────────────────────────┘        └────────────────┘
+              ▲                                        ▲
+              └──── encrypted bundles ── store ────────┘
 ```
 
-The agent owns tailing, cursors, batching, retry and delivery. It does **not** interpret
-content. All parsing happens server-side, over the archive, and can be re-run at will.
+Records are immutable, append-only and never deleted, which makes the dataset a grow-only
+set: convergence needs no merge rule and no conflict resolution. Anti-entropy is a version
+vector — each record carries `(origin_id, seq)`, and sync is "send me everything above my
+watermark per origin".
+
+Membership is a pre-shared key. There are no accounts, invites or tenants: you are in the
+mesh if you hold the key, and that same key seals every record and unlocks the dashboard.
 
 ## Parsing traps
 
@@ -73,9 +79,11 @@ derive session bounds from the first and last records that actually carry a time
 
 ## Storage
 
-- **`raw_lines`** — the archive. Verbatim line bodies as JSONB, partitioned monthly.
-  Unique on `(user_id, session_id, uuid)`, falling back to a content hash for sidecar lines
-  that have no uuid.
+- **`records`** — the archive. Bodies sealed with an AEAD before they touch the disk.
+  Primary key `(origin_id, seq)` for replication; unique on `(origin_id, session_id, uuid)`
+  for semantic identity, falling back to a content-addressed key for lines with no uuid.
+  Scoping to the origin is what stops two machines that share a username and a transcript
+  path from silently merging — which the previous, path-keyed schema did.
 - **`request_usage`** — one row per real API request, unique on `(user_id, request_id)`.
   No cost column: pricing is applied at query time from a versioned table, so history can be
   re-priced.

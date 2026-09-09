@@ -21,35 +21,33 @@ func TestLoadAppliesDefaultsWhenFileIsAbsent(t *testing.T) {
 	}
 }
 
+// A container or CI run should need no file on disk.
 func TestEnvironmentOverridesFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "agent.toml")
+	path := filepath.Join(t.TempDir(), "config.toml")
 	if err := agentcfg.Save(path, agentcfg.Config{
-		Server: agentcfg.ServerConfig{URL: "https://from-file.invalid", Token: "file-token"},
+		Mesh: agentcfg.MeshConfig{PSK: "from-the-file"},
 	}); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 
-	t.Setenv("AGENTIC_STATS_SERVER", "https://from-env.invalid")
-	t.Setenv("AGENTIC_STATS_TOKEN", "env-token")
+	t.Setenv("AGENTIC_STATS_PSK", "from-the-environment")
 
 	cfg, err := agentcfg.Load(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Server.URL != "https://from-env.invalid" {
-		t.Errorf("URL = %q, want the environment value", cfg.Server.URL)
-	}
-	if cfg.Server.Token != "env-token" {
-		t.Errorf("token = %q, want the environment value", cfg.Server.Token)
+	if cfg.Mesh.PSK != "from-the-environment" {
+		t.Errorf("PSK = %q, want the environment value", cfg.Mesh.PSK)
 	}
 }
 
 func TestSaveRoundTrips(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "agent.toml")
 	want := agentcfg.Config{
-		Server:  agentcfg.ServerConfig{URL: "https://example.invalid", Token: "t"},
-		Agent:   agentcfg.AgentConfig{PollInterval: "5m", BatchMaxLines: 42},
-		Privacy: agentcfg.PrivacyConfig{ExcludePaths: []string{"/secret"}},
+		Mesh:      agentcfg.MeshConfig{PSK: "a-key", Listen: ":8844", Discovery: true},
+		Dashboard: agentcfg.DashboardConfig{Listen: "127.0.0.1:9000"},
+		Agent:     agentcfg.AgentConfig{PollInterval: "5m", BatchMaxLines: 42},
+		Privacy:   agentcfg.PrivacyConfig{ExcludePaths: []string{"/secret"}},
 	}
 	if err := agentcfg.Save(path, want); err != nil {
 		t.Fatalf("Save: %v", err)
@@ -58,7 +56,8 @@ func TestSaveRoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if got.Server != want.Server || got.Agent != want.Agent {
+	if got.Mesh.PSK != want.Mesh.PSK || got.Agent != want.Agent ||
+		got.Dashboard != want.Dashboard {
 		t.Errorf("round trip changed the config:\n got %+v\nwant %+v", got, want)
 	}
 	if len(got.Privacy.ExcludePaths) != 1 || got.Privacy.ExcludePaths[0] != "/secret" {
@@ -69,7 +68,9 @@ func TestSaveRoundTrips(t *testing.T) {
 // The file holds a device token, so its mode is a security property.
 func TestSaveWritesOwnerOnlyPermissions(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "agent.toml")
-	if err := agentcfg.Save(path, agentcfg.Config{}); err != nil {
+	if err := agentcfg.Save(path, agentcfg.Config{
+		Mesh: agentcfg.MeshConfig{PSK: "secret"},
+	}); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 	info, err := os.Stat(path)
@@ -77,6 +78,6 @@ func TestSaveWritesOwnerOnlyPermissions(t *testing.T) {
 		t.Fatalf("Stat: %v", err)
 	}
 	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Errorf("config mode = %#o, want 0600: it holds a device token", perm)
+		t.Errorf("config mode = %#o, want 0600: it holds the mesh key", perm)
 	}
 }

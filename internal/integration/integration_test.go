@@ -1,67 +1,82 @@
+// Package integration_test exercises a whole node: collect, store, derive,
+// serve. It needs no database server, so unlike its predecessor it actually
+// runs in a plain `go test ./...` rather than skipping.
 package integration_test
 
 import (
+	"bytes"
 	"context"
-	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
-	"time"
 
-	"github.com/christianparpart/agentic-stats/internal/auth"
 	"github.com/christianparpart/agentic-stats/internal/derive"
 	"github.com/christianparpart/agentic-stats/internal/ingest"
 	"github.com/christianparpart/agentic-stats/internal/pricing"
+	"github.com/christianparpart/agentic-stats/internal/seal"
 	"github.com/christianparpart/agentic-stats/internal/store"
-	"github.com/christianparpart/agentic-stats/internal/storetest"
 	"github.com/christianparpart/agentic-stats/internal/wire"
 )
 
-// tenant is one enrolled user with a device, as the API would see it.
-type tenant struct {
-	userID string
-	device auth.Device
+// node is a whole running node, minus the network.
+type node struct {
+	dir    string
+	dbPath string
+	db     *store.DB
+	keys   *seal.Keys
+	writer *ingest.Writer
+	derive *derive.Service
 }
 
-func newTenant(t *testing.T, db *store.DB, email string) tenant {
+func newNode(t *testing.T) *node {
 	t.Helper()
-	svc, err := auth.NewService(db)
+	psk, err := seal.Generate()
 	if err != nil {
-		t.Fatalf("auth.NewService: %v", err)
+		t.Fatalf("Generate: %v", err)
 	}
-	ctx := context.Background()
-
-	userID, err := svc.CreateUser(ctx, email, "correct-horse-battery-staple", auth.RoleUser)
-	if err != nil {
-		t.Fatalf("CreateUser: %v", err)
-	}
-	code, err := svc.CreateEnrollmentCode(ctx, userID, time.Hour)
-	if err != nil {
-		t.Fatalf("CreateEnrollmentCode: %v", err)
-	}
-	token, err := svc.RedeemEnrollment(ctx, code, wire.Device{
-		Hostname: "host-" + email, OS: "linux", Arch: "arm64", Timezone: "UTC",
-	})
-	if err != nil {
-		t.Fatalf("RedeemEnrollment: %v", err)
-	}
-	dev, err := svc.AuthenticateDevice(ctx, token)
-	if err != nil {
-		t.Fatalf("AuthenticateDevice: %v", err)
-	}
-	if dev.UserID != userID {
-		t.Fatalf("device belongs to %s, want %s", dev.UserID, userID)
-	}
-	return tenant{userID: userID, device: dev}
+	return newNodeWithKey(t, psk)
 }
 
-// assistantLine builds a transcript line shaped like the real thing: one
-// content block per line, every line repeating the whole usage object.
+func newNodeWithKey(t *testing.T, psk string) *node {
+	t.Helper()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "archive.db")
+
+	keys, err := seal.Derive(psk)
+	if err != nil {
+		t.Fatalf("Derive: %v", err)
+	}
+	db, err := store.Open(context.Background(), store.Config{Path: dbPath})
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() }) // test cleanup
+
+	writer, err := ingest.NewWriter(db, keys)
+	if err != nil {
+		t.Fatalf("ingest.NewWriter: %v", err)
+	}
+	prices, err := pricing.Load()
+	if err != nil {
+		t.Fatalf("pricing.Load: %v", err)
+	}
+	svc, err := derive.NewService(db, prices)
+	if err != nil {
+		t.Fatalf("derive.NewService: %v", err)
+	}
+	return &node{dir: dir, dbPath: dbPath, db: db, keys: keys, writer: writer, derive: svc}
+}
+
+// assistantLine is shaped like the real thing: one content block per line,
+// every line repeating the whole usage object for the response.
 func assistantLine(requestID, model string, output, cacheRead int64) string {
-	return fmt.Sprintf(`{"type":"assistant","requestId":%q,"timestamp":"2026-09-08T12:00:00.000Z",
-		"message":{"model":%q,"usage":{"input_tokens":10,"output_tokens":%d,
-		"cache_read_input_tokens":%d,"output_tokens_details":{"thinking_tokens":5},
-		"cache_creation":{"ephemeral_5m_input_tokens":100,"ephemeral_1h_input_tokens":0}}}}`,
-		requestID, model, output, cacheRead)
+	return fmt.Sprintf(`{"type":"assistant","requestId":%q,"uuid":%q,`+
+		`"sessionId":"session-1","timestamp":"2026-09-08T12:00:00.000Z",`+
+		`"message":{"model":%q,"usage":{"input_tokens":10,"output_tokens":%d,`+
+		`"cache_read_input_tokens":%d,"output_tokens_details":{"thinking_tokens":5},`+
+		`"cache_creation":{"ephemeral_5m_input_tokens":100,"ephemeral_1h_input_tokens":0}}}}`,
+		requestID, requestID+"-"+fmt.Sprint(output)+"-"+fmt.Sprint(cacheRead), model, output, cacheRead)
 }
 
 func records(lines ...string) []wire.Record {
@@ -72,61 +87,24 @@ func records(lines ...string) []wire.Record {
 	return out
 }
 
-func TestEnrollmentIsSingleUse(t *testing.T) {
-	db := storetest.Open(t)
-	svc, err := auth.NewService(db)
-	if err != nil {
-		t.Fatalf("auth.NewService: %v", err)
-	}
+// The property the whole pipeline rests on: re-collecting is free and harmless.
+func TestReCollectingIsIdempotent(t *testing.T) {
+	n := newNode(t)
 	ctx := context.Background()
-
-	userID, err := svc.CreateUser(ctx, "once@example.invalid", "pw", auth.RoleUser)
-	if err != nil {
-		t.Fatalf("CreateUser: %v", err)
-	}
-	code, err := svc.CreateEnrollmentCode(ctx, userID, time.Hour)
-	if err != nil {
-		t.Fatalf("CreateEnrollmentCode: %v", err)
-	}
-	dev := wire.Device{Hostname: "h", OS: "linux", Arch: "amd64"}
-
-	if _, err := svc.RedeemEnrollment(ctx, code, dev); err != nil {
-		t.Fatalf("first redemption: %v", err)
-	}
-	if _, err := svc.RedeemEnrollment(ctx, code, dev); !errors.Is(err, auth.ErrInvalidCredential) {
-		t.Errorf("replayed code: err = %v, want ErrInvalidCredential", err)
-	}
-	if _, err := svc.AuthenticateDevice(ctx, "not-a-real-token"); !errors.Is(err, auth.ErrInvalidCredential) {
-		t.Errorf("bogus token: err = %v, want ErrInvalidCredential", err)
-	}
-}
-
-// The property the whole pipeline rests on: re-sending is free and harmless,
-// which is what lets the collector advance its cursor only after an ack.
-func TestIngestDeduplicatesReplayedBatches(t *testing.T) {
-	db := storetest.Open(t)
-	ten := newTenant(t, db, "dedupe@example.invalid")
-	svc, err := ingest.NewService(db)
-	if err != nil {
-		t.Fatalf("ingest.NewService: %v", err)
-	}
-	ctx := context.Background()
-
 	batch := records(
 		assistantLine("req-1", "claude-opus-5", 100, 1000),
 		assistantLine("req-2", "claude-opus-5", 200, 2000),
 	)
 
-	first, err := svc.Store(ctx, ten.device, wire.Header{}, batch)
+	first, err := n.writer.Ingest(ctx, batch)
 	if err != nil {
-		t.Fatalf("first Store: %v", err)
+		t.Fatalf("first Ingest: %v", err)
 	}
 	if first.Stored != 2 || first.Duplicates != 0 {
-		t.Errorf("first store = %+v, want 2 stored / 0 duplicates", first)
+		t.Errorf("first ingest = %+v, want 2 stored", first)
 	}
-
 	for i := range 3 {
-		again, err := svc.Store(ctx, ten.device, wire.Header{}, batch)
+		again, err := n.writer.Ingest(ctx, batch)
 		if err != nil {
 			t.Fatalf("replay %d: %v", i, err)
 		}
@@ -136,51 +114,32 @@ func TestIngestDeduplicatesReplayedBatches(t *testing.T) {
 	}
 }
 
-// The fold, end to end through the database.
+// The single highest-value test in the repository: the fold, end to end.
 func TestDeriveFoldsRepeatedUsageByRequestID(t *testing.T) {
-	db := storetest.Open(t)
-	ten := newTenant(t, db, "fold@example.invalid")
-
-	ingestSvc, err := ingest.NewService(db)
-	if err != nil {
-		t.Fatalf("ingest.NewService: %v", err)
-	}
-	prices, err := pricing.Load()
-	if err != nil {
-		t.Fatalf("pricing.Load: %v", err)
-	}
-	deriveSvc, err := derive.NewService(db, prices)
-	if err != nil {
-		t.Fatalf("derive.NewService: %v", err)
-	}
+	n := newNode(t)
 	ctx := context.Background()
 
 	// One API response written as four lines, as Claude Code does for a
 	// thinking + text + two tool_use response. Every line repeats the usage.
-	// A second, distinct request follows.
 	batch := records(
 		assistantLine("req-A", "claude-opus-5", 1000, 5000),
 		assistantLine("req-A", "claude-opus-5", 1000, 5000),
 		assistantLine("req-A", "claude-opus-5", 1000, 5000),
 		assistantLine("req-A", "claude-opus-5", 1000, 5000),
 		assistantLine("req-B", "claude-opus-5", 500, 2000),
-		// A synthetic error line carries no usable usage and must be excluded.
+		// A synthetic error line must never reach a cost calculation.
 		`{"type":"assistant","requestId":null,"message":{"model":"<synthetic>","usage":{"output_tokens":0}}}`,
 	)
-	if _, err := ingestSvc.Store(ctx, ten.device, wire.Header{}, batch); err != nil {
-		t.Fatalf("Store: %v", err)
+	if _, err := n.writer.Ingest(ctx, batch); err != nil {
+		t.Fatalf("Ingest: %v", err)
 	}
 
-	sum, err := deriveSvc.Summarize(ctx, ten.userID)
+	sum, err := n.derive.Summarize(ctx)
 	if err != nil {
 		t.Fatalf("Summarize: %v", err)
 	}
-
 	if sum.Requests != 2 {
 		t.Errorf("requests = %d, want 2 (req-A folded from 4 lines, plus req-B)", sum.Requests)
-	}
-	if sum.AssistantLines != 5 {
-		t.Errorf("assistant lines = %d, want 5", sum.AssistantLines)
 	}
 	if len(sum.Models) != 1 {
 		t.Fatalf("models = %d, want 1", len(sum.Models))
@@ -198,77 +157,118 @@ func TestDeriveFoldsRepeatedUsageByRequestID(t *testing.T) {
 	if sum.CacheSavingsUSD <= 0 {
 		t.Errorf("cache savings = %v, want positive", sum.CacheSavingsUSD)
 	}
-}
 
-// The invariant that protects everyone's source code from everyone else's.
-func TestRowLevelSecurityIsolatesTenants(t *testing.T) {
-	db := storetest.Open(t)
-	alice := newTenant(t, db, "alice@example.invalid")
-	bob := newTenant(t, db, "bob@example.invalid")
-
-	ingestSvc, err := ingest.NewService(db)
+	days, err := n.derive.Daily(ctx)
 	if err != nil {
-		t.Fatalf("ingest.NewService: %v", err)
+		t.Fatalf("Daily: %v", err)
 	}
-	prices, err := pricing.Load()
-	if err != nil {
-		t.Fatalf("pricing.Load: %v", err)
-	}
-	deriveSvc, err := derive.NewService(db, prices)
-	if err != nil {
-		t.Fatalf("derive.NewService: %v", err)
-	}
-	ctx := context.Background()
-
-	if _, err := ingestSvc.Store(ctx, alice.device, wire.Header{},
-		records(assistantLine("alice-req", "claude-opus-5", 999, 1))); err != nil {
-		t.Fatalf("store for alice: %v", err)
-	}
-
-	aliceSum, err := deriveSvc.Summarize(ctx, alice.userID)
-	if err != nil {
-		t.Fatalf("summarize alice: %v", err)
-	}
-	if aliceSum.Lines != 1 {
-		t.Errorf("alice sees %d lines, want 1", aliceSum.Lines)
-	}
-
-	bobSum, err := deriveSvc.Summarize(ctx, bob.userID)
-	if err != nil {
-		t.Fatalf("summarize bob: %v", err)
-	}
-	if bobSum.Lines != 0 {
-		t.Errorf("bob sees %d of alice's lines, want 0 -- tenant isolation is broken", bobSum.Lines)
-	}
-	if bobSum.Requests != 0 {
-		t.Errorf("bob sees %d of alice's requests, want 0", bobSum.Requests)
+	if len(days) != 1 || days[0].Requests != 2 {
+		t.Errorf("daily = %+v, want one day with 2 requests", days)
 	}
 }
 
-// A connection that never establishes a tenant must see nothing, not everything.
-func TestQueriesWithoutATenantSeeNothing(t *testing.T) {
-	db := storetest.Open(t)
-	alice := newTenant(t, db, "notenant@example.invalid")
-
-	ingestSvc, err := ingest.NewService(db)
-	if err != nil {
-		t.Fatalf("ingest.NewService: %v", err)
-	}
+// The central privacy claim, checked against the file on disk rather than
+// asserted: a stolen archive must yield nothing.
+func TestArchiveOnDiskIsSealed(t *testing.T) {
+	n := newNode(t)
 	ctx := context.Background()
-	if _, err := ingestSvc.Store(ctx, alice.device, wire.Header{},
-		records(assistantLine("r", "claude-opus-5", 1, 1))); err != nil {
-		t.Fatalf("Store: %v", err)
+
+	const secret = "SUPER-SECRET-CUSTOMER-SOURCE-CODE"
+	line := fmt.Sprintf(`{"type":"user","uuid":"u1","sessionId":"s1","message":{"content":%q}}`, secret)
+	if _, err := n.writer.Ingest(ctx, records(line)); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if err := n.db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 
-	var visible int64
-	err = db.InAuthTx(ctx, func(ctx context.Context, tx pgxTx) error {
-		return tx.QueryRow(ctx, `SELECT count(*) FROM raw_lines`).Scan(&visible)
-	})
+	raw, err := os.ReadFile(n.dbPath)
 	if err != nil {
-		t.Fatalf("count without tenant: %v", err)
+		t.Fatalf("read database file: %v", err)
 	}
-	if visible != 0 {
-		t.Errorf("a tenantless connection saw %d rows, want 0; "+
-			"is the application role a superuser or does it hold BYPASSRLS?", visible)
+	if bytes.Contains(raw, []byte(secret)) {
+		t.Fatal("the database file contains transcript content in the clear")
+	}
+	// Sanity: the marker really was long enough to find if it were present.
+	if len(raw) < len(secret) {
+		t.Fatal("database file is implausibly small; the check proved nothing")
+	}
+}
+
+// A different mesh cannot read this one's records even holding the file.
+func TestAnotherMeshCannotRead(t *testing.T) {
+	mine := newNode(t)
+	ctx := context.Background()
+	if _, err := mine.writer.Ingest(ctx, records(
+		assistantLine("req-1", "claude-opus-5", 10, 10))); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+
+	held, err := mine.db.Since(ctx, mine.db.OriginID(), 0, 10)
+	if err != nil {
+		t.Fatalf("Since: %v", err)
+	}
+	if len(held) != 1 {
+		t.Fatalf("held %d records, want 1", len(held))
+	}
+
+	stranger := newNode(t)
+	if _, err := stranger.keys.OpenPayload(held[0].Sealed); err == nil {
+		t.Fatal("a node with a different mesh key opened our record")
+	}
+	// Our own key must of course still work, or the archive is a brick.
+	if _, err := mine.keys.OpenPayload(held[0].Sealed); err != nil {
+		t.Fatalf("our own key could not open our record: %v", err)
+	}
+}
+
+// Two nodes holding the same key converge on identical figures — the property
+// the whole mesh exists to provide, tested here at the store level before any
+// networking exists.
+func TestReplicasWithTheSameKeyAgree(t *testing.T) {
+	psk, err := seal.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	a := newNodeWithKey(t, psk)
+	b := newNodeWithKey(t, psk)
+	ctx := context.Background()
+
+	batch := records(
+		assistantLine("req-A", "claude-opus-5", 1000, 5000),
+		assistantLine("req-A", "claude-opus-5", 1000, 5000),
+		assistantLine("req-B", "claude-sonnet-5", 300, 900),
+	)
+	if _, err := a.writer.Ingest(ctx, batch); err != nil {
+		t.Fatalf("Ingest on A: %v", err)
+	}
+
+	// Hand A's records to B exactly as a sync would, origin and sequence intact.
+	shipped, err := a.db.Since(ctx, a.db.OriginID(), 0, 1000)
+	if err != nil {
+		t.Fatalf("Since: %v", err)
+	}
+	if _, err := b.db.AppendRemote(ctx, shipped); err != nil {
+		t.Fatalf("AppendRemote on B: %v", err)
+	}
+
+	sumA, err := a.derive.Summarize(ctx)
+	if err != nil {
+		t.Fatalf("Summarize A: %v", err)
+	}
+	sumB, err := b.derive.Summarize(ctx)
+	if err != nil {
+		t.Fatalf("Summarize B: %v", err)
+	}
+	if sumA.Requests != sumB.Requests || sumA.Lines != sumB.Lines {
+		t.Errorf("replicas disagree: A %d requests / %d lines, B %d / %d",
+			sumA.Requests, sumA.Lines, sumB.Requests, sumB.Lines)
+	}
+	if fmt.Sprintf("%.6f", sumA.TotalCostUSD) != fmt.Sprintf("%.6f", sumB.TotalCostUSD) {
+		t.Errorf("replicas disagree on cost: A %v, B %v", sumA.TotalCostUSD, sumB.TotalCostUSD)
+	}
+	// And B's copy must be readable, not just present.
+	if sumB.TotalCostUSD <= 0 {
+		t.Error("the replica derived no cost; the records did not survive the trip")
 	}
 }

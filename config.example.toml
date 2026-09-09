@@ -1,38 +1,56 @@
-# agentic-stats agent configuration — EXAMPLE
-# Copy to ~/.config/agentic-stats/agent.toml and edit.
-# The real file is gitignored. Never commit it.
+# agentic-stats configuration — EXAMPLE
+#
+# Copy to ~/.config/agentic-stats/config.toml, or let `agentic-stats init`
+# write it for you. The real file holds the mesh key and is gitignored.
 
-[server]
-# Base URL of your agentic-stats server.
-url = "https://stats.example.com"
+[mesh]
+# The one secret. It admits this machine to the mesh, encrypts every record,
+# and unlocks the dashboard. Generate it with `agentic-stats init`; never
+# invent one, and never commit it. May also be given as $AGENTIC_STATS_PSK.
+psk = "GENERATED-BY-INIT-DO-NOT-USE-THIS-VALUE"
 
-# Device token, obtained by redeeming an enrollment code:
-#   agentic-stats-agent enroll --code ABCD-EFGH
-# Stored in the OS keychain where available; this key is the fallback.
-# token = "paste-device-token-here"
+# Address other nodes connect to. Empty disables inbound peering.
+listen = ":8844"
+
+# Announce and listen for peers on the local network.
+discovery = true
+
+# Peers that discovery cannot reach. Multicast does not cross a WireGuard or
+# Tailscale tunnel — a point-to-point link is not a broadcast domain — so
+# anything on the far side of one belongs here. Names are re-resolved on every
+# dial, so DNS names that move are fine.
+peers = [
+  # "vm.example.internal:8844",
+  # "laptop.tailnet.ts.net:8844",
+]
+
+# Interfaces to keep beacons off. VM bridges are the usual case.
+exclude_interfaces = [
+  # "bridge100",
+]
+
+[dashboard]
+# Loopback by default: http://127.0.0.1 is already a secure context in every
+# browser, so there is no certificate to manage and no warning. Bind elsewhere
+# and HTTPS is used, with a self-signed certificate generated on first run.
+listen = "127.0.0.1:8899"
+
+# Supply your own certificate to avoid the self-signed browser warning.
+# tls_cert = "/path/to/cert.pem"
+# tls_key  = "/path/to/key.pem"
 
 [agent]
-# How often to scan the source roots for new data.
+# How often to look for new transcript data.
 poll_interval = "30s"
 
-# Upload batching.
-batch_max_lines = 5000
-batch_max_bytes = "8MiB"
-
-# Backfill pacing, so first run does not saturate an uplink.
-backfill_rate = "2MiB/s"
-# backfill_since = "2020-01-01"
-
-[sources.claude_code]
-enabled = true
-# Extra roots beyond the platform defaults.
-# roots = ["/opt/shared/.claude/projects"]
-
-[sources.claude_desktop]
-enabled = true
+# Records per write batch.
+batch_max_lines = 2000
 
 [privacy]
-# Absolute path prefixes that are never read or transmitted.
+# Absolute path prefixes that are never read, never stored, and never
+# replicated to any peer. Note that file paths are stored as plain columns so
+# they can be queried, which means they reveal project names — if that matters
+# for a project, exclude it here rather than relying on encryption.
 exclude_paths = [
   # "/Users/you/work/confidential",
 ]

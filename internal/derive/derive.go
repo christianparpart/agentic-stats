@@ -16,8 +16,6 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/christianparpart/agentic-stats/internal/pricing"
 	"github.com/christianparpart/agentic-stats/internal/store"
 )
@@ -98,87 +96,126 @@ func NewService(db *store.DB, prices *pricing.Table) (*Service, error) {
 
 // foldedUsageCTE selects one row per API request.
 //
-// DISTINCT ON (request_id) is the fold: every line of a multi-block response
-// carries an identical usage object, so any one of them is the whole truth and
-// the rest are copies. Synthetic and error lines carry a null requestId and
-// all-zero usage, and are excluded rather than counted as free requests.
+// The fold is `GROUP BY request_id` with a single `min()` over bare columns.
+// SQLite documents this: with exactly one min() or max() in the query, bare
+// columns are taken from the row that produced it. That is precisely the fold's
+// semantics -- every line of a multi-block response carries an identical usage
+// object, so any one of them is the whole truth and the rest are copies.
+//
+// The min() is over a composite of origin and sequence rather than over one
+// column, because ties must be *impossible*, not merely unlikely: two nodes
+// running this query must return the same row or we would chase phantom
+// divergence between replicas that actually agree.
+//
+// Rows with a NULL request_id are excluded by construction -- ingest leaves it
+// NULL on anything that is not a billable assistant response, including the
+// synthetic error lines that carry all-zero usage.
 const foldedUsageCTE = `
-WITH parsed AS (
-    SELECT try_jsonb(raw) AS b FROM raw_lines
-),
-assistant AS (
-    SELECT
-        b->>'requestId'                                                  AS request_id,
-        COALESCE(b->'message'->>'model', 'unknown')                      AS model,
-        left(b->>'timestamp', 10)                                        AS day,
-        COALESCE((b->'message'->'usage'->>'input_tokens')::bigint, 0)    AS input_tokens,
-        COALESCE((b->'message'->'usage'->>'output_tokens')::bigint, 0)   AS output_tokens,
-        COALESCE((b->'message'->'usage'->>'cache_read_input_tokens')::bigint, 0)
-                                                                         AS cache_read_tokens,
-        COALESCE((b->'message'->'usage'->'cache_creation'->>'ephemeral_5m_input_tokens')::bigint, 0)
-                                                                         AS cache_write_5m_tokens,
-        COALESCE((b->'message'->'usage'->'cache_creation'->>'ephemeral_1h_input_tokens')::bigint, 0)
-                                                                         AS cache_write_1h_tokens,
-        COALESCE((b->'message'->'usage'->'output_tokens_details'->>'thinking_tokens')::bigint, 0)
-                                                                         AS thinking_tokens
-    FROM parsed
-    WHERE b IS NOT NULL
-      AND b->>'type' = 'assistant'
-      AND b->>'requestId' IS NOT NULL
-      AND COALESCE(b->'message'->>'model', '') <> '<synthetic>'
-      AND b->'message'->'usage' IS NOT NULL
-),
-folded AS (
-    SELECT DISTINCT ON (request_id) * FROM assistant ORDER BY request_id
+WITH folded AS (
+    SELECT model,
+           substr(coalesce(captured_at, ''), 1, 10) AS day,
+           input_tokens, output_tokens, think_tokens,
+           cache_read, cache_write5m, cache_write1h,
+           min(origin_id || ':' || printf('%020d', seq)) AS pick
+      FROM records
+     WHERE request_id IS NOT NULL
+     GROUP BY request_id
 )`
 
-// Summarize computes the whole-archive summary for one tenant.
-func (s *Service) Summarize(ctx context.Context, userID string) (Summary, error) {
+// Summarize computes the whole-archive summary.
+func (s *Service) Summarize(ctx context.Context) (Summary, error) {
 	var sum Summary
+	db := s.db.SQL()
 
-	err := s.db.InTenantTx(ctx, userID, func(ctx context.Context, tx pgx.Tx) error {
-		if err := tx.QueryRow(ctx, `SELECT count(*) FROM raw_lines`).Scan(&sum.Lines); err != nil {
-			return fmt.Errorf("derive: count lines: %w", err)
-		}
-		if err := tx.QueryRow(ctx,
-			foldedUsageCTE+` SELECT count(*) FROM assistant`).Scan(&sum.AssistantLines); err != nil {
-			return fmt.Errorf("derive: count assistant lines: %w", err)
-		}
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM records`).Scan(&sum.Lines); err != nil {
+		return Summary{}, fmt.Errorf("derive: count lines: %w", err)
+	}
+	if err := db.QueryRowContext(ctx,
+		`SELECT count(*) FROM records WHERE request_id IS NOT NULL`).Scan(&sum.AssistantLines); err != nil {
+		return Summary{}, fmt.Errorf("derive: count assistant lines: %w", err)
+	}
 
-		rows, err := tx.Query(ctx, foldedUsageCTE+`
-			SELECT model,
-			       count(*),
-			       sum(input_tokens),
-			       sum(output_tokens),
-			       sum(cache_read_tokens),
-			       sum(cache_write_5m_tokens),
-			       sum(cache_write_1h_tokens),
-			       sum(thinking_tokens)
-			  FROM folded
-			 GROUP BY model
-			 ORDER BY sum(output_tokens) DESC`)
-		if err != nil {
-			return fmt.Errorf("derive: summarize by model: %w", err)
-		}
-		defer rows.Close()
-
-		for rows.Next() {
-			var m ModelUsage
-			if err := rows.Scan(&m.Model, &m.Requests,
-				&m.InputTokens, &m.OutputTokens, &m.CacheReadTokens,
-				&m.CacheWrite5mTokens, &m.CacheWrite1hTokens, &m.Thinking); err != nil {
-				return fmt.Errorf("derive: scan model row: %w", err)
-			}
-			sum.Models = append(sum.Models, m)
-		}
-		return rows.Err()
-	})
+	rows, err := db.QueryContext(ctx, foldedUsageCTE+`
+		SELECT coalesce(model, 'unknown'),
+		       count(*),
+		       sum(input_tokens), sum(output_tokens),
+		       sum(cache_read), sum(cache_write5m), sum(cache_write1h),
+		       sum(think_tokens)
+		  FROM folded
+		 GROUP BY model
+		 ORDER BY sum(output_tokens) DESC`)
 	if err != nil {
-		return Summary{}, err
+		return Summary{}, fmt.Errorf("derive: summarize by model: %w", err)
+	}
+	defer func() { _ = rows.Close() }() // rows fully drained below
+
+	for rows.Next() {
+		var m ModelUsage
+		if err := rows.Scan(&m.Model, &m.Requests,
+			&m.InputTokens, &m.OutputTokens, &m.CacheReadTokens,
+			&m.CacheWrite5mTokens, &m.CacheWrite1hTokens, &m.Thinking); err != nil {
+			return Summary{}, fmt.Errorf("derive: scan model row: %w", err)
+		}
+		sum.Models = append(sum.Models, m)
+	}
+	if err := rows.Err(); err != nil {
+		return Summary{}, fmt.Errorf("derive: summarize by model: %w", err)
 	}
 
 	s.price(&sum)
 	return sum, nil
+}
+
+// Daily returns per-day activity, oldest first.
+func (s *Service) Daily(ctx context.Context) ([]Day, error) {
+	rows, err := s.db.SQL().QueryContext(ctx, foldedUsageCTE+`
+		SELECT day, coalesce(model, 'unknown'), count(*), sum(output_tokens),
+		       sum(input_tokens), sum(cache_read),
+		       sum(cache_write5m), sum(cache_write1h)
+		  FROM folded
+		 WHERE day <> ''
+		 GROUP BY day, model
+		 ORDER BY day`)
+	if err != nil {
+		return nil, fmt.Errorf("derive: daily: %w", err)
+	}
+	defer func() { _ = rows.Close() }() // rows fully drained below
+
+	byDay := make(map[string]*Day)
+	var order []string
+	for rows.Next() {
+		var (
+			day, model string
+			u          pricing.Usage
+			requests   int64
+			output     int64
+		)
+		if err := rows.Scan(&day, &model, &requests, &output,
+			&u.Input, &u.CacheRead, &u.CacheWrite5m, &u.CacheWrite1h); err != nil {
+			return nil, fmt.Errorf("derive: scan daily row: %w", err)
+		}
+		u.Output = output
+		d, ok := byDay[day]
+		if !ok {
+			d = &Day{Date: day}
+			byDay[day] = d
+			order = append(order, day)
+		}
+		d.Requests += requests
+		d.OutputTokens += output
+		if cost, priced := s.prices.Cost(model, u); priced {
+			d.CostUSD += cost
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("derive: daily: %w", err)
+	}
+
+	days := make([]Day, 0, len(order))
+	for _, day := range order {
+		days = append(days, *byDay[day])
+	}
+	return days, nil
 }
 
 // price fills in costs and the derived ratios.
@@ -196,6 +233,7 @@ func (s *Service) price(sum *Summary) {
 		cost, ok := s.prices.Cost(m.Model, m.Usage)
 		m.CostUSD, m.Priced = cost, ok
 		if !ok {
+			// An unknown model is surfaced, never silently free.
 			sum.UnpricedModels = append(sum.UnpricedModels, m.Model)
 		} else {
 			uncached, _ := s.prices.UncachedCost(m.Model, m.Usage)
@@ -215,61 +253,4 @@ func (s *Service) price(sum *Summary) {
 	if sum.Requests > 0 {
 		sum.Inflation = float64(sum.AssistantLines) / float64(sum.Requests)
 	}
-}
-
-// Daily returns per-day activity, most recent last.
-func (s *Service) Daily(ctx context.Context, userID string) ([]Day, error) {
-	var days []Day
-	err := s.db.InTenantTx(ctx, userID, func(ctx context.Context, tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, foldedUsageCTE+`
-			SELECT day, model, count(*), sum(output_tokens),
-			       sum(input_tokens), sum(cache_read_tokens),
-			       sum(cache_write_5m_tokens), sum(cache_write_1h_tokens)
-			  FROM folded
-			 WHERE day <> ''
-			 GROUP BY day, model
-			 ORDER BY day`)
-		if err != nil {
-			return fmt.Errorf("derive: daily: %w", err)
-		}
-		defer rows.Close()
-
-		byDay := make(map[string]*Day)
-		var order []string
-		for rows.Next() {
-			var (
-				day, model string
-				u          pricing.Usage
-				requests   int64
-				output     int64
-			)
-			if err := rows.Scan(&day, &model, &requests, &output,
-				&u.Input, &u.CacheRead, &u.CacheWrite5m, &u.CacheWrite1h); err != nil {
-				return fmt.Errorf("derive: scan daily row: %w", err)
-			}
-			u.Output = output
-			d, ok := byDay[day]
-			if !ok {
-				d = &Day{Date: day}
-				byDay[day] = d
-				order = append(order, day)
-			}
-			d.Requests += requests
-			d.OutputTokens += output
-			if cost, priced := s.prices.Cost(model, u); priced {
-				d.CostUSD += cost
-			}
-		}
-		if err := rows.Err(); err != nil {
-			return err
-		}
-		for _, day := range order {
-			days = append(days, *byDay[day])
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return days, nil
 }

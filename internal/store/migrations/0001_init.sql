@@ -1,156 +1,112 @@
--- Tenancy and the raw-line archive.
+-- The archive, as a peer replica.
 --
--- Row-level security is established here, in the first migration, rather than
--- added later: this database holds complete transcripts, including source code,
--- and isolation must never depend on remembering a WHERE clause.
+-- There is no tenant column and no row-level security: membership is the
+-- pre-shared key, and a node holds exactly one mesh's data. What replaced RLS
+-- is that record bodies are sealed before they are written, so the file is
+-- worthless without the key.
 
--- gen_random_uuid() is built into PostgreSQL 13 and later, so no extension is
--- required. That matters: CREATE EXTENSION needs database-owner rights, and the
--- application role deliberately has none.
-
-CREATE TABLE users (
-    id            uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
-    email         text        NOT NULL UNIQUE,
-    display_name  text        NOT NULL DEFAULT '',
-    password_hash text        NOT NULL,
-    role          text        NOT NULL DEFAULT 'user'
-                              CHECK (role IN ('admin', 'user')),
-    -- Reserved so a future team view is additive rather than a rewrite.
-    org_id        uuid,
-    created_at    timestamptz NOT NULL DEFAULT now()
+-- Exactly one row. The node's own identity lives in the database it labels --
+-- not in a config file, which gets rsynced between machines, and not derived
+-- from a hostname or MAC, which repeat. A duplicated origin id is the one
+-- failure mode that corrupts silently, so the id travels with its data.
+CREATE TABLE node (
+    singleton  INTEGER PRIMARY KEY CHECK (singleton = 1),
+    origin_id  TEXT    NOT NULL,
+    created_at TEXT    NOT NULL
 );
 
--- Registration is invite-only: open signup on an internet-facing instance
--- holding this payload is not sensible.
-CREATE TABLE invites (
-    code_hash   text        PRIMARY KEY,
-    email       text,
-    created_by  uuid        REFERENCES users (id) ON DELETE SET NULL,
-    expires_at  timestamptz NOT NULL,
-    redeemed_at timestamptz,
-    redeemed_by uuid        REFERENCES users (id) ON DELETE SET NULL
+CREATE TABLE records (
+    origin_id    TEXT    NOT NULL,
+    -- Gap-free and monotonic per origin, allocated inside the insert
+    -- transaction so the database is the counter. Gap-freeness is
+    -- load-bearing: "everything after my watermark" is only correct
+    -- without holes.
+    seq          INTEGER NOT NULL,
+
+    source       TEXT    NOT NULL,
+    path         TEXT    NOT NULL,
+    byte_offset  INTEGER NOT NULL,
+    -- Also the fork detector: the same (origin, seq) arriving with a
+    -- different hash is proof that an origin id was duplicated.
+    content_hash TEXT    NOT NULL,
+
+    -- Extracted for identity and for the metric layer, because a sealed body
+    -- cannot be read by SQL. The sealed line remains authoritative and every
+    -- one of these is recomputable from it by reprocess.
+    session_id   TEXT,
+    line_uuid    TEXT,
+    captured_at  TEXT,
+
+    -- The metric fields, extracted once at write time.
+    --
+    -- A sealed body cannot be read by SQL, so re-parsing per query is not an
+    -- option here as it was under Postgres. Promoting them to columns is also
+    -- faster and avoids SQLite's expression-index trap, where an index over a
+    -- JSON expression is only used when the query text matches it exactly.
+    -- request_id is NULL on everything that is not a billable assistant
+    -- response, which is what makes the fold's WHERE clause trivial.
+    request_id    TEXT,
+    model         TEXT,
+    input_tokens  INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    think_tokens  INTEGER NOT NULL DEFAULT 0,
+    cache_read    INTEGER NOT NULL DEFAULT 0,
+    cache_write5m INTEGER NOT NULL DEFAULT 0,
+    cache_write1h INTEGER NOT NULL DEFAULT 0,
+
+    sealed       BLOB    NOT NULL,
+    received_at  TEXT    NOT NULL,
+
+    PRIMARY KEY (origin_id, seq)
+) WITHOUT ROWID;
+
+-- Semantic identity, scoped to the origin.
+--
+-- Scoping matters: it is what stops two machines that happen to share a
+-- username and a transcript path from silently merging into one row, which the
+-- previous schema did. Within one origin, a session relocated into a worktree
+-- and appended under a second path still converges, because the session and
+-- uuid pair is stable.
+CREATE UNIQUE INDEX records_semantic_uuid
+    ON records (origin_id, session_id, line_uuid)
+    WHERE line_uuid IS NOT NULL;
+
+CREATE UNIQUE INDEX records_semantic_hash
+    ON records (origin_id, source, path, byte_offset, content_hash)
+    WHERE line_uuid IS NULL;
+
+CREATE INDEX records_captured ON records (captured_at);
+
+-- Serves the fold directly: one row per request, ordered so ties cannot occur.
+CREATE INDEX records_request ON records (request_id, origin_id, seq)
+    WHERE request_id IS NOT NULL;
+
+-- How far each peer has confirmed, per origin. Advanced in the same
+-- transaction that commits the records it covers: advance-then-crash loses
+-- data permanently and invisibly.
+CREATE TABLE watermarks (
+    peer_id   TEXT    NOT NULL,
+    origin_id TEXT    NOT NULL,
+    seq       INTEGER NOT NULL,
+    PRIMARY KEY (peer_id, origin_id)
+) WITHOUT ROWID;
+
+-- Configured and learned peer addresses, persisted so a cold start does not
+-- need the bootstrap node to be up.
+CREATE TABLE peers (
+    peer_id   TEXT PRIMARY KEY,
+    addrs     TEXT NOT NULL,
+    last_seen TEXT,
+    static    INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
+
+-- Fork evidence. A conflicting (origin, seq) is never silently discarded and
+-- never merged: it is kept here and surfaced, because the alternative is
+-- invisible data loss that reports itself as healthy convergence.
+CREATE TABLE quarantine (
+    origin_id    TEXT    NOT NULL,
+    seq          INTEGER NOT NULL,
+    content_hash TEXT    NOT NULL,
+    sealed       BLOB    NOT NULL,
+    noticed_at   TEXT    NOT NULL
 );
-
-CREATE TABLE devices (
-    id            uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id       uuid        NOT NULL REFERENCES users (id) ON DELETE CASCADE,
-    hostname      text        NOT NULL,
-    os            text        NOT NULL DEFAULT '',
-    arch          text        NOT NULL DEFAULT '',
-    -- The machine's IANA zone, so "busy hours" can be rendered in local time
-    -- rather than smeared across zones by VMs that run UTC.
-    timezone      text        NOT NULL DEFAULT '',
-    agent_version text        NOT NULL DEFAULT '',
-    first_seen    timestamptz NOT NULL DEFAULT now(),
-    last_seen     timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (user_id, hostname, os, arch)
-);
-
--- A device redeems a short-lived enrollment code once, for a long-lived
--- revocable token. Revoking one machine never touches the others.
-CREATE TABLE enrollment_codes (
-    code_hash   text        PRIMARY KEY,
-    user_id     uuid        NOT NULL REFERENCES users (id) ON DELETE CASCADE,
-    expires_at  timestamptz NOT NULL,
-    redeemed_at timestamptz
-);
-
-CREATE TABLE device_tokens (
-    token_hash text        PRIMARY KEY,
-    device_id  uuid        NOT NULL REFERENCES devices (id) ON DELETE CASCADE,
-    user_id    uuid        NOT NULL REFERENCES users (id) ON DELETE CASCADE,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    last_used  timestamptz,
-    revoked_at timestamptz
-);
-
--- The archive. Lines are stored verbatim and never modified.
---
--- The primary key is (user_id, source, path, byte_offset, content_hash) rather
--- than anything derived from the line's meaning: ingest must not interpret its
--- payload. content_hash participates so that a file replaced in place, whose
--- new content occupies the same offsets, does not collide with the old.
---
--- Semantic deduplication -- the same session relocated into a worktree and
--- appended to under a second path -- happens in derive, on (session, uuid).
-CREATE TABLE raw_lines (
-    user_id      uuid        NOT NULL REFERENCES users (id) ON DELETE CASCADE,
-    device_id    uuid        NOT NULL REFERENCES devices (id) ON DELETE CASCADE,
-    source       text        NOT NULL,
-    path         text        NOT NULL,
-    byte_offset  bigint      NOT NULL,
-    content_hash text        NOT NULL,
-    -- The line exactly as it appeared on disk.
-    raw          text        NOT NULL,
-    -- Parsed form when the payload is JSON, for querying without re-parsing.
-    -- NULL is not a failure: a line we cannot parse today is still archived,
-    -- and reprocessing can fill this in once a parser exists.
-    body         jsonb,
-    ingested_at  timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (user_id, source, path, byte_offset, content_hash)
-);
-
-CREATE INDEX raw_lines_user_ingested_idx ON raw_lines (user_id, ingested_at);
-CREATE INDEX raw_lines_device_idx        ON raw_lines (device_id);
-
--- Tenant isolation, enforced by the database.
---
--- Two tiers, and the distinction is deliberate.
---
--- Payload tables (raw_lines, devices) carry FORCE. FORCE matters because
--- without it the table owner -- which is the role the application connects as
--- -- silently bypasses every policy. These hold complete transcripts including
--- source code, so isolation must not depend on remembering a WHERE clause.
---
--- Credential tables (users, invites, enrollment_codes, device_tokens) have RLS
--- enabled but not FORCE. They must be readable before a tenant is known: an
--- ingest request arrives with only a bearer token, and resolving that token to
--- a user is precisely how the tenant gets established. A non-owner role is
--- still constrained by the policies below; the owner may read them, and the
--- application does so only through the narrow lookup path in internal/auth,
--- which sets app.user_id immediately afterwards.
---
--- current_setting(..., true) returns NULL when unset, so a connection that
--- forgot to establish a tenant sees nothing rather than everything.
-
-ALTER TABLE users            ENABLE ROW LEVEL SECURITY;
-ALTER TABLE invites          ENABLE ROW LEVEL SECURITY;
-ALTER TABLE devices          ENABLE ROW LEVEL SECURITY;
-ALTER TABLE device_tokens    ENABLE ROW LEVEL SECURITY;
-ALTER TABLE enrollment_codes ENABLE ROW LEVEL SECURITY;
-ALTER TABLE raw_lines        ENABLE ROW LEVEL SECURITY;
-
-ALTER TABLE devices   FORCE ROW LEVEL SECURITY;
-ALTER TABLE raw_lines FORCE ROW LEVEL SECURITY;
-
-CREATE POLICY users_self ON users
-    USING (id = nullif(current_setting('app.user_id', true), '')::uuid);
-
-CREATE POLICY devices_tenant ON devices
-    USING (user_id = nullif(current_setting('app.user_id', true), '')::uuid)
-    WITH CHECK (user_id = nullif(current_setting('app.user_id', true), '')::uuid);
-
-CREATE POLICY device_tokens_tenant ON device_tokens
-    USING (user_id = nullif(current_setting('app.user_id', true), '')::uuid);
-
-CREATE POLICY enrollment_codes_tenant ON enrollment_codes
-    USING (user_id = nullif(current_setting('app.user_id', true), '')::uuid);
-
--- WITH CHECK is what stops a compromised or buggy writer from filing lines
--- under another tenant's id.
-CREATE POLICY raw_lines_tenant ON raw_lines
-    USING (user_id = nullif(current_setting('app.user_id', true), '')::uuid)
-    WITH CHECK (user_id = nullif(current_setting('app.user_id', true), '')::uuid);
-
--- Postgres has no TRY_CAST, and raw lines are archived before anything knows
--- whether they are JSON. This lets queries interpret the archive without a
--- second stored copy of every line, and without a malformed line aborting a
--- whole query.
-CREATE FUNCTION try_jsonb(t text) RETURNS jsonb
-    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS $$
-BEGIN
-    RETURN t::jsonb;
-EXCEPTION WHEN others THEN
-    RETURN NULL;
-END;
-$$;

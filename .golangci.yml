@@ -63,9 +63,24 @@ linters:
             - pkg: github.com/christianparpart/agentic-stats/internal/derive
               desc: "the collector must not interpret transcripts (AGENT.md: Architecture)"
             - pkg: github.com/christianparpart/agentic-stats/internal/pricing
-              desc: "pricing is a server-side concern (AGENT.md: Architecture)"
+              desc: "pricing is a query-time concern (AGENT.md: Architecture)"
             - pkg: github.com/christianparpart/agentic-stats/internal/store
-              desc: "the agent never talks to the database (AGENT.md: Architecture)"
+              desc: "collection does not touch the archive directly (AGENT.md: Architecture)"
+
+        # The pre-shared key has exactly one home. Anything that imports seal
+        # can reach key material, so the set that may do so is kept small and
+        # enforced rather than remembered.
+        psk-lives-in-seal:
+          files:
+            - "**/internal/source/**"
+            - "**/internal/cursor/**"
+            - "**/internal/wire/**"
+            - "**/internal/collector/**"
+            - "**/internal/derive/**"
+            - "**/internal/pricing/**"
+          deny:
+            - pkg: github.com/christianparpart/agentic-stats/internal/seal
+              desc: "only ingest, api and the mesh may hold keys (AGENT.md: Membership is the PSK)"
 
         # Lower layers must not import higher ones.
         no-upward-imports:
@@ -78,8 +93,8 @@ linters:
           deny:
             - pkg: github.com/christianparpart/agentic-stats/internal/api
               desc: "lower layers must not import the HTTP layer (AGENT.md: Architecture)"
-            - pkg: github.com/christianparpart/agentic-stats/internal/rollup
-              desc: "lower layers must not import rollup (AGENT.md: Architecture)"
+            - pkg: github.com/christianparpart/agentic-stats/internal/ingest
+              desc: "lower layers must not import the write path (AGENT.md: Architecture)"
 
 formatters:
   enable:
