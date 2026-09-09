@@ -1,0 +1,521 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agentic-stats — a peer-to-peer archive for AI coding assistants</title>
+<meta name="description" content="Your AI coding assistant deletes its own history after about 30 days. agentic-stats runs one daemon per machine, finds its peers, and syncs until every machine holds everything. No server, no database, no account.">
+<meta property="og:title" content="agentic-stats">
+<meta property="og:description" content="One daemon per machine. They find each other, authenticate from a shared key, and sync both ways until every machine holds everything. There is no server.">
+<meta property="og:type" content="website">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;800&family=IBM+Plex+Mono:wght@400;500&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --ink:#0E1A38;
+  --ink-deep:#080F26;
+  --ultramarine:#2F4FD8;
+  --cyan:#57CFE4;
+  --paper-warm:#F7F8FB;
+  --dust:#A29B90;
+  --text:#16203A;
+  --muted:#586182;
+  --rule:#D3D8E4;
+  --measure:66ch;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%;scroll-behavior:smooth}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+body{
+  margin:0;
+  background:var(--paper-warm);
+  color:var(--text);
+  font-family:"Source Serif 4",Georgia,"Times New Roman",serif;
+  font-size:18px;
+  line-height:1.66;
+  font-variant-numeric:tabular-nums;
+}
+h1,h2,h3,nav,.ui{font-family:Archivo,"Helvetica Neue",Arial,sans-serif;letter-spacing:-0.02em}
+a{color:var(--ultramarine)}
+a:focus-visible,button:focus-visible{outline:3px solid var(--cyan);outline-offset:3px}
+code,pre{font-family:"IBM Plex Mono",ui-monospace,Consolas,monospace}
+.wrap{max-width:1080px;margin:0 auto;padding:0 28px}
+
+/* ---------- masthead ---------- */
+.masthead{background:var(--ink);color:#fff}
+.masthead .wrap{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:20px 28px}
+.wordmark{font-family:"IBM Plex Mono",monospace;font-size:15px;font-weight:500;color:#fff;text-decoration:none}
+.wordmark b{color:var(--cyan);font-weight:500}
+.masthead nav{display:flex;flex-wrap:wrap;gap:24px;font-size:14px;font-weight:600}
+.masthead nav a{color:#C3CBE0;text-decoration:none}
+.masthead nav a:hover{color:#fff}
+
+/* ---------- hero ---------- */
+.hero{background:var(--ink);color:#fff;padding:40px 0 0}
+.hero h1{font-size:clamp(2.2rem,6vw,4.2rem);font-weight:800;line-height:1.03;margin:0 0 24px;max-width:17ch}
+.hero .lede{max-width:var(--measure);color:#CFD6E8;font-size:1.1rem;margin:0 0 44px}
+.hero .lede strong{color:#fff;font-weight:600}
+
+/* the convergence matrix — the page's one bold element */
+.matrix{margin:0 0 14px;border-top:1px solid rgba(255,255,255,.2)}
+.node{display:grid;grid-template-columns:96px 1fr;align-items:center;gap:18px;padding:11px 0;border-bottom:1px solid rgba(255,255,255,.1)}
+.node-name{font-family:"IBM Plex Mono",monospace;font-size:12.5px;color:#9AA6C6;text-align:right}
+.track{position:relative;height:24px;overflow:hidden}
+.track-all,.track-held{
+  position:absolute;top:0;bottom:0;right:0;
+  background-image:repeating-linear-gradient(90deg,currentColor 0 3px,transparent 3px 8px);
+}
+.track-all{left:0;color:var(--dust);opacity:.42}
+/* Converged is the truthful resting state, so it is the default: without
+   motion the rows simply read as full. The animation only replays how they
+   got there. */
+.track-held{color:var(--cyan);width:100%}
+@media (prefers-reduced-motion:no-preference){
+  .track-held{width:var(--held);animation:converge 1.5s cubic-bezier(.33,0,.15,1) forwards}
+  .node:nth-child(1) .track-held{animation-delay:.55s}
+  .node:nth-child(2) .track-held{animation-delay:.75s}
+  .node:nth-child(3) .track-held{animation-delay:.95s}
+  .node:nth-child(4) .track-held{animation-delay:1.15s}
+  @keyframes converge{to{width:100%}}
+}
+.matrix-legend{display:flex;flex-wrap:wrap;gap:8px 28px;padding:0 0 40px;margin:0;font-family:Archivo,sans-serif;font-size:13px;font-weight:600}
+.matrix-legend span{display:flex;align-items:center;gap:9px}
+.matrix-legend i{width:15px;height:9px;display:inline-block;border-radius:1px}
+.swatch-held{background:var(--cyan)}
+.swatch-lost{background:var(--dust);opacity:.55}
+.matrix-legend .held{color:var(--cyan)}
+.matrix-legend .lost{color:var(--dust)}
+
+.actions{display:flex;flex-wrap:wrap;gap:14px;padding-bottom:60px}
+.btn{font-family:Archivo,sans-serif;font-size:15px;font-weight:600;padding:13px 24px;border-radius:2px;text-decoration:none;display:inline-block}
+.btn-primary{background:var(--cyan);color:var(--ink-deep)}
+.btn-primary:hover{background:#7BDDEE}
+.btn-ghost{border:1px solid rgba(255,255,255,.34);color:#fff}
+.btn-ghost:hover{border-color:#fff}
+
+/* ---------- sections ---------- */
+section{padding:74px 0;border-bottom:1px solid var(--rule)}
+section h2{font-size:clamp(1.5rem,3.2vw,2.05rem);font-weight:800;margin:0 0 10px;line-height:1.14}
+section .standfirst{max-width:var(--measure);color:var(--muted);margin:0 0 40px}
+section p{max-width:var(--measure)}
+section h3{font-size:1.02rem;font-weight:800;margin:0 0 6px}
+
+/* ---------- the key ---------- */
+.key-grid{display:grid;grid-template-columns:repeat(3,1fr);border-top:2px solid var(--ink)}
+.key-grid > div{padding:22px 26px 24px 0;border-right:1px solid var(--rule)}
+.key-grid > div:last-child{border-right:0;padding-right:0}
+.key-grid > div:not(:first-child){padding-left:26px}
+.key-grid p{font-size:.94rem;line-height:1.55;color:var(--muted);margin:0}
+
+/* ---------- capability list ---------- */
+.caps{margin:0;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);column-gap:56px}
+.caps > div{padding:20px 0;border-top:1px solid var(--rule)}
+.caps dt{font-family:Archivo,sans-serif;font-weight:800;font-size:1.02rem;margin:0 0 4px}
+.caps dd{margin:0;font-size:.96rem;line-height:1.58;color:var(--muted)}
+
+/* ---------- reach ---------- */
+.reach{border-top:2px solid var(--ink);margin:0}
+.reach > div{padding:24px 0;border-bottom:1px solid var(--rule);display:grid;grid-template-columns:220px 1fr;gap:32px;align-items:start}
+.reach > div:last-child{border-bottom:0}
+.reach h3{margin:0}
+.reach .when{font-family:"IBM Plex Mono",monospace;font-size:12px;color:var(--ultramarine);margin:4px 0 0}
+.reach p{margin:0 0 12px;font-size:.96rem;color:var(--muted)}
+.reach p:last-child{margin-bottom:0}
+
+/* ---------- counting table ---------- */
+.counts{width:100%;border-collapse:collapse;margin:0 0 22px;font-size:.95rem}
+.counts caption{text-align:left;color:var(--muted);font-size:.9rem;padding-bottom:14px;max-width:var(--measure)}
+.counts th{font-family:Archivo,sans-serif;font-size:12px;font-weight:600;color:var(--muted);text-align:right;padding:0 0 10px;border-bottom:2px solid var(--ink)}
+.counts th:first-child{text-align:left}
+.counts td{padding:13px 0;border-bottom:1px solid var(--rule);text-align:right}
+.counts td:first-child{text-align:left;font-family:Archivo,sans-serif;font-weight:600;font-size:.95rem}
+.counts .naive{color:var(--dust)}
+.counts .over{font-family:Archivo,sans-serif;font-weight:800;color:var(--ultramarine);white-space:nowrap}
+.factorbar{display:inline-block;height:9px;background:var(--ultramarine);vertical-align:middle;margin-right:10px;opacity:.28}
+
+/* ---------- quickstart ---------- */
+ol.steps{list-style:none;counter-reset:s;margin:0;padding:0}
+ol.steps > li{counter-increment:s;padding:0 0 34px 62px;position:relative}
+ol.steps > li::before{content:counter(s);position:absolute;left:0;top:-2px;font-family:Archivo,sans-serif;font-weight:800;font-size:1.5rem;color:var(--ultramarine);width:44px;text-align:right}
+ol.steps p{font-size:.95rem;color:var(--muted);margin:0 0 12px}
+pre{background:var(--ink-deep);color:#DDE4F5;padding:18px 20px;border-radius:3px;overflow-x:auto;font-size:13.5px;line-height:1.75;margin:0 0 12px}
+pre:last-child{margin-bottom:0}
+pre .c{color:#7C89AE}
+pre .v{color:var(--cyan)}
+.note{max-width:var(--measure);font-size:.95rem;color:var(--muted)}
+
+/* ---------- privacy ---------- */
+.privacy{background:var(--ink);color:#fff;border-bottom:0}
+.privacy h2{color:#fff}
+.privacy p{color:#CFD6E8}
+.privacy .standfirst{color:#9AA6C6}
+.privacy code{background:rgba(255,255,255,.1);padding:1px 6px;border-radius:2px;font-size:.9em}
+.privacy ul{max-width:var(--measure);padding-left:20px;color:#CFD6E8;margin:0}
+.privacy li{margin-bottom:10px}
+
+/* ---------- footer ---------- */
+footer{background:var(--ink-deep);color:#8B96B8;padding:44px 0;font-size:14px}
+footer .wrap{display:flex;flex-wrap:wrap;gap:18px;justify-content:space-between;align-items:baseline}
+footer a{color:#C3CBE0}
+footer .req{font-family:"IBM Plex Mono",monospace;font-size:12.5px}
+
+@media (max-width:820px){
+  .key-grid{grid-template-columns:1fr}
+  .key-grid > div{border-right:0;border-bottom:1px solid var(--rule);padding:20px 0}
+  .key-grid > div:not(:first-child){padding-left:0}
+  .key-grid > div:last-child{border-bottom:0}
+  .reach > div{grid-template-columns:1fr;gap:10px}
+}
+@media (max-width:760px){
+  body{font-size:17px}
+  .caps{grid-template-columns:1fr}
+  .node{grid-template-columns:70px 1fr;gap:12px}
+  .masthead .wrap{flex-direction:column;align-items:flex-start;gap:12px}
+  .counts .hide-s{display:none}
+  ol.steps > li{padding-left:40px}
+  ol.steps > li::before{width:26px;font-size:1.2rem}
+}
+</style>
+</head>
+<body>
+
+<header class="masthead">
+  <div class="wrap">
+    <a class="wordmark" href="./">agentic<b>-</b>stats</a>
+    <nav>
+      <a href="#how">How it works</a>
+      <a href="#key">The key</a>
+      <a href="#reach">Reaching peers</a>
+      <a href="#counting">Counting</a>
+      <a href="#quickstart">Quickstart</a>
+      <a href="https://github.com/christianparpart/agentic-stats">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="hero">
+  <div class="wrap">
+    <h1>Every machine holds everything.</h1>
+    <p class="lede">
+      Claude Code records what it does on the machine where it happened — every request, the
+      exact token counts, the git branch, a diff of every file it touched. Then it deletes
+      that record on a rolling window of about thirty days. <strong>There is no export and no
+      copy anywhere else.</strong> agentic-stats runs one daemon per machine. The daemons find
+      each other, authenticate from a shared key, and sync both ways until every machine holds
+      the whole history. There is no server.
+    </p>
+
+    <div class="matrix" aria-hidden="true">
+      <div class="node">
+        <span class="node-name">laptop</span>
+        <div class="track"><div class="track-all"></div><div class="track-held" style="--held:19%"></div></div>
+      </div>
+      <div class="node">
+        <span class="node-name">desktop</span>
+        <div class="track"><div class="track-all"></div><div class="track-held" style="--held:24%"></div></div>
+      </div>
+      <div class="node">
+        <span class="node-name">build-vm</span>
+        <div class="track"><div class="track-all"></div><div class="track-held" style="--held:14%"></div></div>
+      </div>
+      <div class="node">
+        <span class="node-name">homelab</span>
+        <div class="track"><div class="track-all"></div><div class="track-held" style="--held:21%"></div></div>
+      </div>
+    </div>
+    <p class="matrix-legend">
+      <span class="held"><i class="swatch-held"></i>Still on the machine</span>
+      <span class="lost"><i class="swatch-lost"></i>Deleted locally, kept by the mesh</span>
+    </p>
+
+    <div class="actions">
+      <a class="btn btn-primary" href="#quickstart">Get started</a>
+      <a class="btn btn-ghost" href="https://github.com/christianparpart/agentic-stats">Source on GitHub</a>
+    </div>
+  </div>
+</div>
+
+<section id="how">
+  <div class="wrap">
+    <h2>One binary, no server, no database</h2>
+    <p class="standfirst">
+      Each node collects from its own machine, keeps a full local replica, and reconciles with
+      any peer it can reach. Nodes are equal: there is no node whose loss matters more than
+      another's, and no node you have to keep running.
+    </p>
+    <div class="key-grid">
+      <div>
+        <h3>Collect</h3>
+        <p>
+          Discovers append-only transcript files, tails them from a durable cursor, and seals
+          each record before it is written. Survives reboots, rotation, and a laptop that
+          spends the weekend shut.
+        </p>
+      </div>
+      <div>
+        <h3>Converge</h3>
+        <p>
+          Peers exchange version vectors and ask each other for everything after a watermark.
+          Sync runs both ways, so it does not matter which machine starts it or which was
+          offline last week.
+        </p>
+      </div>
+      <div>
+        <h3>Read</h3>
+        <p>
+          Every node serves its own dashboard over the replica it already holds. Nothing to
+          deploy, nothing to keep up, and no node that has to be awake for you to read your
+          own history.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="get">
+  <div class="wrap">
+    <h2>What you get</h2>
+    <p class="standfirst">
+      One view over every machine you work on, served from the binary itself. The same figures
+      come back as JSON from <code>/v1/summary</code> and <code>/v1/daily</code> if you would
+      rather query them.
+    </p>
+    <dl class="caps">
+      <div>
+        <dt>An archive that replicates</dt>
+        <dd>Raw transcript lines kept verbatim on every node. The more machines you have, the safer the data — losing one loses nothing.</dd>
+      </div>
+      <div>
+        <dt>Encrypted at rest</dt>
+        <dd>Record bodies are sealed with a key derived from the mesh key, so a stolen laptop or a copied database file yields nothing.</dd>
+      </div>
+      <div>
+        <dt>Cost</dt>
+        <dd>API-equivalent cost from real token counts against a versioned price table, with the cache-read and cache-write split broken out — and what prompt caching actually saved you.</dd>
+      </div>
+      <div>
+        <dt>Time</dt>
+        <dd>Active coding time, busy hours, busy days, streaks, and trends by day, week, month and year.</dd>
+      </div>
+      <div>
+        <dt>Projects</dt>
+        <dd>What you actually worked on over time, joined across every machine rather than one directory at a time.</dd>
+      </div>
+      <div>
+        <dt>Delivery</dt>
+        <dd>Cost per pull request, joined exactly: the assistant records which pull request each session opened, so this is not branch-name guessing. A session that produced several splits its cost evenly between them, labelled as an allocation.</dd>
+      </div>
+      <div>
+        <dt>Fleet health</dt>
+        <dd>Which machines are still reporting, and whether the archive has gaps you should know about.</dd>
+      </div>
+      <div>
+        <dt>No account system</dt>
+        <dd>You join a mesh by holding its key. That is the whole membership model — no users, no invites, no sign-up.</dd>
+      </div>
+    </dl>
+  </div>
+</section>
+
+<section id="key">
+  <div class="wrap">
+    <h2>One key does three jobs</h2>
+    <p class="standfirst">
+      <code>agentic-stats init</code> generates it on your first machine. Every other machine
+      adopts the same value with <code>join --key</code>. Holding it is what membership means.
+    </p>
+    <div class="key-grid">
+      <div>
+        <h3>Admits the machine</h3>
+        <p>Peers authenticate the key before they exchange anything. A node without it is not turned away politely — it is never spoken to.</p>
+      </div>
+      <div>
+        <h3>Encrypts every record</h3>
+        <p>Bodies are sealed before they are written, so the local database file and anything bridged through third-party storage are ciphertext.</p>
+      </div>
+      <div>
+        <h3>Unlocks the dashboard</h3>
+        <p>The dashboard takes the same key instead of a password. There is no separate credential to issue, rotate or forget.</p>
+      </div>
+    </div>
+    <p class="note" style="margin-top:32px">
+      Use the generated key, or any passphrase of at least 20 characters — passphrases are
+      stretched with argon2id, because a memorable phrase carries far less entropy than its
+      length suggests and this archive's ciphertext is exposed by design. There is no recovery
+      if you lose it. The archive is encrypted with it.
+    </p>
+  </div>
+</section>
+
+<section id="reach">
+  <div class="wrap">
+    <h2>Reaching the other machines</h2>
+    <p class="standfirst">
+      Three ways, in order of how little you have to configure. Nodes use whichever ones apply
+      and do not need to agree on the choice.
+    </p>
+    <div class="reach">
+      <div>
+        <div>
+          <h3>Shared network</h3>
+          <p class="when">automatic</p>
+        </div>
+        <div>
+          <p>Nodes announce themselves and listen for the announcements of others. Two machines on the same Wi-Fi or the same LAN find each other with no configuration at all.</p>
+        </div>
+      </div>
+      <div>
+        <div>
+          <h3>Across a tunnel</h3>
+          <p class="when">mesh.peers</p>
+        </div>
+        <div>
+          <p>Multicast does not cross a WireGuard or Tailscale link — a point-to-point tunnel is not a broadcast domain, so discovery genuinely cannot reach the far side. List those machines instead. Names are re-resolved on every dial, so hosts that move are fine.</p>
+<pre>[mesh]
+peers = [<span class="v">"vm.example.internal:8844"</span>, <span class="v">"laptop.tailnet.ts.net:8844"</span>]</pre>
+        </div>
+      </div>
+      <div>
+        <div>
+          <h3>Never on the same network</h3>
+          <p class="when">bridge</p>
+        </div>
+        <div>
+          <p>Point both machines at one folder and they converge through it — any synced folder, NAS or SMB share. Bundles written there are encrypted including their metadata, because the storage provider is not trusted.</p>
+<pre>[bridge]
+kind = <span class="v">"filesystem"</span>
+path = <span class="v">"~/Dropbox/agentic-stats"</span></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="counting">
+  <div class="wrap">
+    <h2>Getting the numbers right</h2>
+    <p class="standfirst">
+      Claude Code writes one line per content block, and every one of those lines repeats the
+      complete usage object for the whole API response. Add them up and you over-count — by a
+      different factor for each metric, so it cannot be corrected afterwards.
+    </p>
+    <table class="counts">
+      <caption>Measured on a real archive. The fold by <code>requestId</code> happens once, in <code>internal/derive</code>.</caption>
+      <thead>
+        <tr>
+          <th scope="col">Metric</th>
+          <th scope="col" class="hide-s">Naive sum</th>
+          <th scope="col">Folded by requestId</th>
+          <th scope="col">Over-count</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Output tokens</td>
+          <td class="naive hide-s">13,095,501</td>
+          <td>5,249,480</td>
+          <td class="over"><span class="factorbar" style="width:62px"></span>2.49&times;</td>
+        </tr>
+        <tr>
+          <td>Thinking tokens</td>
+          <td class="naive hide-s">6,278,373</td>
+          <td>2,071,020</td>
+          <td class="over"><span class="factorbar" style="width:76px"></span>3.03&times;</td>
+        </tr>
+        <tr>
+          <td>Cache reads</td>
+          <td class="naive hide-s">4,477,680,713</td>
+          <td>2,347,702,854</td>
+          <td class="over"><span class="factorbar" style="width:48px"></span>1.91&times;</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      A uniqueness constraint makes the mistake structurally impossible rather than a rule
+      somebody has to remember. Because two nodes must return the same row for the same query,
+      ties in the fold are resolved deterministically — otherwise replicas that agree would
+      look like they had diverged.
+    </p>
+  </div>
+</section>
+
+<section id="quickstart">
+  <div class="wrap">
+    <h2>Quickstart</h2>
+    <p class="standfirst">
+      Requires only Go. No database server, no cloud account, no certificates, no root.
+    </p>
+    <ol class="steps">
+      <li>
+        <h3>Build, and start a mesh on your first machine</h3>
+        <p>The key is printed once. Keep it somewhere you will still have it after the laptop is gone.</p>
+<pre>make build
+./bin/agentic-stats init          <span class="c"># prints the key -- there is no recovery</span></pre>
+      </li>
+      <li>
+        <h3>Adopt that key everywhere else</h3>
+        <p>Every machine you want in the archive, including headless VMs.</p>
+<pre>./bin/agentic-stats join --key <span class="v">&lt;key&gt;</span></pre>
+      </li>
+      <li>
+        <h3>Collect and serve</h3>
+        <p>The dashboard is served by the node itself. Sign in with the mesh key.</p>
+<pre>./bin/agentic-stats run           <span class="c"># dashboard on http://127.0.0.1:8899</span>
+./bin/agentic-stats once          <span class="c"># or a single pass and exit</span>
+./bin/agentic-stats status        <span class="c"># what this node holds, and its peers</span></pre>
+      </li>
+      <li>
+        <h3>Start it at login</h3>
+        <p>
+          A <em>user</em> service on all three platforms — launchd, systemd&nbsp;<code>--user</code>,
+          or Task Scheduler. The daemon reads one person's home directory, so it never needs
+          root or an administrator. On Linux it also attempts <code>loginctl enable-linger</code>,
+          without which a user service stops the moment you log out — exactly wrong on a
+          headless VM.
+        </p>
+<pre>./bin/agentic-stats install
+./bin/agentic-stats service       <span class="c"># is it installed and running?</span>
+./bin/agentic-stats uninstall     <span class="c"># the archive is untouched</span></pre>
+      </li>
+    </ol>
+    <p class="note">
+      The dashboard binds to loopback, where <code>http://127.0.0.1</code> is already a secure
+      context in every browser — no certificate to manage and no warning. Bind it anywhere else
+      and it switches to HTTPS with a self-signed certificate, or supply your own.
+    </p>
+  </div>
+</section>
+
+<section id="privacy" class="privacy">
+  <div class="wrap">
+    <h2>Read this before you run it</h2>
+    <p class="standfirst">
+      The daemon replicates full transcripts by default. That is the point — it doubles as the
+      backup for data your machines are about to delete. Transcripts contain your prompts and
+      your source code.
+    </p>
+    <ul>
+      <li>Every node holds everything. Adding a machine to the mesh gives that machine your whole archive, so add only machines you trust as much as the one you are reading this on.</li>
+      <li>Use <code>privacy.exclude_paths</code> to withhold projects that must never leave the machine. Excluded paths are never read, never stored and never replicated.</li>
+      <li>File paths are stored as plain columns so they can be queried, which means they reveal project names. If that matters for a project, exclude it rather than relying on encryption.</li>
+      <li>Record bodies are sealed with a key derived from the mesh key, and nothing is written to the archive unsealed — there is a test that greps the database file for exactly that.</li>
+      <li>Anything bridged through a synced folder is encrypted including its metadata. The storage provider is not trusted.</li>
+      <li>Nothing personal lives in the repository. Test fixtures are synthetic.</li>
+    </ul>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <span class="req">Go 1.27 &middot; Apache-2.0 &middot; macOS, Linux, Windows</span>
+    <span>
+      <a href="https://github.com/christianparpart/agentic-stats">Repository</a> &nbsp;
+      <a href="https://github.com/christianparpart/agentic-stats/blob/master/docs/design.md">Design notes</a> &nbsp;
+      <a href="https://github.com/christianparpart/agentic-stats/blob/master/CONTRIBUTING.md">Contributing</a>
+    </span>
+  </div>
+</footer>
+
+</body>
+</html>
