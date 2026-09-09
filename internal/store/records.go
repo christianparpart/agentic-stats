@@ -44,6 +44,10 @@ type Record struct {
 	CacheWrite5m int64
 	CacheWrite1h int64
 
+	// PRRepo and PRNumber are set on pr-link lines.
+	PRRepo   string
+	PRNumber int64
+
 	Sealed []byte
 }
 
@@ -195,8 +199,9 @@ const insertSQL = `
 	     session_id, line_uuid, captured_at,
 	     request_id, model, input_tokens, output_tokens, think_tokens,
 	     cache_read, cache_write5m, cache_write1h,
+	     pr_repo, pr_number,
 	     sealed, received_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT DO NOTHING`
 
 // execInsert runs one insert and reports whether a row was written.
@@ -206,6 +211,7 @@ func execInsert(ctx context.Context, stmt *sql.Stmt, r Record, now string) (int6
 		nullable(r.SessionID), nullable(r.LineUUID), nullable(r.CapturedAt),
 		nullable(r.RequestID), nullable(r.Model),
 		r.Input, r.Output, r.Thinking, r.CacheRead, r.CacheWrite5m, r.CacheWrite1h,
+		nullable(r.PRRepo), nullableInt(r.PRNumber),
 		r.Sealed, now)
 	if err != nil {
 		return 0, fmt.Errorf("store: insert record: %w", err)
@@ -224,6 +230,15 @@ func nullable(s string) any {
 		return nil
 	}
 	return s
+}
+
+// nullableInt maps zero to SQL NULL, so a partial index skips the rows that
+// carry no value rather than indexing a wall of zeroes.
+func nullableInt(v int64) any {
+	if v == 0 {
+		return nil
+	}
+	return v
 }
 
 // nextSeq returns the next free sequence for an origin.
@@ -277,7 +292,8 @@ func (db *DB) Since(ctx context.Context, origin string, after int64, limit int) 
 		       coalesce(session_id, ''), coalesce(line_uuid, ''),
 		       coalesce(captured_at, ''), coalesce(request_id, ''), coalesce(model, ''),
 		       input_tokens, output_tokens, think_tokens,
-		       cache_read, cache_write5m, cache_write1h, sealed
+		       cache_read, cache_write5m, cache_write1h,
+		       coalesce(pr_repo, ''), coalesce(pr_number, 0), sealed
 		  FROM records
 		 WHERE origin_id = ? AND seq > ?
 		 ORDER BY seq
@@ -293,7 +309,8 @@ func (db *DB) Since(ctx context.Context, origin string, after int64, limit int) 
 		if err := rows.Scan(&r.OriginID, &r.Seq, &r.Source, &r.Path, &r.ByteOffset,
 			&r.ContentHash, &r.SessionID, &r.LineUUID, &r.CapturedAt,
 			&r.RequestID, &r.Model, &r.Input, &r.Output, &r.Thinking,
-			&r.CacheRead, &r.CacheWrite5m, &r.CacheWrite1h, &r.Sealed); err != nil {
+			&r.CacheRead, &r.CacheWrite5m, &r.CacheWrite1h,
+			&r.PRRepo, &r.PRNumber, &r.Sealed); err != nil {
 			return nil, fmt.Errorf("store: scan record: %w", err)
 		}
 		out = append(out, r)

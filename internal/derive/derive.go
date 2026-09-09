@@ -15,6 +15,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"strconv"
 
 	"github.com/christianparpart/agentic-stats/internal/pricing"
 	"github.com/christianparpart/agentic-stats/internal/store"
@@ -113,6 +115,7 @@ func NewService(db *store.DB, prices *pricing.Table) (*Service, error) {
 const foldedUsageCTE = `
 WITH folded AS (
     SELECT model,
+           session_id,
            substr(coalesce(captured_at, ''), 1, 10) AS day,
            input_tokens, output_tokens, think_tokens,
            cache_read, cache_write5m, cache_write1h,
@@ -216,6 +219,144 @@ func (s *Service) Daily(ctx context.Context) ([]Day, error) {
 		days = append(days, *byDay[day])
 	}
 	return days, nil
+}
+
+// PullRequest is what one shipped pull request cost.
+type PullRequest struct {
+	Repo   string `json:"repo"`
+	Number int64  `json:"number"`
+	// Sessions and Requests count the work that *touched* this pull request.
+	// They are not additive across pull requests: one session can open
+	// several, and its requests are counted against each of them.
+	Sessions int64 `json:"sessions"`
+	Requests int64 `json:"requests"`
+	Output   int64 `json:"output_tokens"`
+	// CostUSD is this pull request's *share*. Where a session opened several,
+	// its cost is split evenly between them, so these do sum -- and sum to no
+	// more than the archive total.
+	CostUSD float64 `json:"cost_usd"`
+	// SharedSessions is how many of this PR's sessions also produced others,
+	// which is what makes the share an allocation rather than a measurement.
+	SharedSessions int64 `json:"shared_sessions"`
+}
+
+// Delivery reports what the archive says about shipped work.
+type Delivery struct {
+	PullRequests []PullRequest `json:"pull_requests"`
+	// TotalCostUSD is the cost of sessions that produced a pull request.
+	TotalCostUSD float64 `json:"total_cost_usd"`
+	// Attributed is the share of all requests belonging to a session that
+	// produced at least one pull request. Counted on distinct requests, so it
+	// cannot exceed one however many pull requests a session opened.
+	Attributed float64 `json:"attributed"`
+}
+
+// Deliveries attributes cost to the pull requests sessions produced.
+//
+// The join itself is exact: the assistant records a pr-link line naming the
+// repository and number when it opens a pull request, so no branch-name
+// guessing or time-window correlation is involved.
+//
+// The *allocation* is not exact, and says so. A session that opened three pull
+// requests did work for all three, and there is nothing in the transcript that
+// says how to divide it, so the cost is split evenly. Attributing the whole
+// session to each would triple-count -- which is the same error the requestId
+// fold exists to prevent, arriving by a different route.
+func (s *Service) Deliveries(ctx context.Context) (Delivery, error) {
+	var out Delivery
+
+	rows, err := s.db.SQL().QueryContext(ctx, foldedUsageCTE+`,
+links AS (
+    SELECT DISTINCT session_id, pr_repo, pr_number
+      FROM records
+     WHERE pr_repo IS NOT NULL AND session_id IS NOT NULL
+),
+-- How many pull requests each session produced, which is the divisor.
+weights AS (
+    SELECT session_id, count(*) AS pr_count FROM links GROUP BY session_id
+)
+SELECT l.pr_repo, l.pr_number,
+       coalesce(f.model, 'unknown'),
+       count(*),
+       count(DISTINCT f.session_id),
+       sum(CASE WHEN w.pr_count > 1 THEN 1 ELSE 0 END),
+       sum(f.output_tokens),
+       sum(CAST(f.input_tokens   AS REAL) / w.pr_count),
+       sum(CAST(f.output_tokens  AS REAL) / w.pr_count),
+       sum(CAST(f.cache_read     AS REAL) / w.pr_count),
+       sum(CAST(f.cache_write5m  AS REAL) / w.pr_count),
+       sum(CAST(f.cache_write1h  AS REAL) / w.pr_count)
+  FROM folded f
+  JOIN links   l ON l.session_id = f.session_id
+  JOIN weights w ON w.session_id = f.session_id
+ GROUP BY l.pr_repo, l.pr_number, f.model`)
+	if err != nil {
+		return Delivery{}, fmt.Errorf("derive: deliveries: %w", err)
+	}
+	defer func() { _ = rows.Close() }() // rows fully drained below
+
+	// One row per (pull request, model); fold to one entry per pull request so
+	// a session that switched models still reports a single cost.
+	index := make(map[string]int)
+	for rows.Next() {
+		var (
+			repo, model                       string
+			number, requests, sessions, share int64
+			output                            int64
+			in, outTok, cr, c5, c1            float64
+		)
+		if err := rows.Scan(&repo, &number, &model, &requests, &sessions, &share, &output,
+			&in, &outTok, &cr, &c5, &c1); err != nil {
+			return Delivery{}, fmt.Errorf("derive: scan delivery row: %w", err)
+		}
+		cost, _ := s.prices.Cost(model, pricing.Usage{
+			Input:        int64(in),
+			Output:       int64(outTok),
+			CacheRead:    int64(cr),
+			CacheWrite5m: int64(c5),
+			CacheWrite1h: int64(c1),
+		})
+
+		key := repo + "#" + strconv.FormatInt(number, 10)
+		if i, ok := index[key]; ok {
+			out.PullRequests[i].Requests += requests
+			out.PullRequests[i].Output += output
+			out.PullRequests[i].CostUSD += cost
+			continue
+		}
+		index[key] = len(out.PullRequests)
+		out.PullRequests = append(out.PullRequests, PullRequest{
+			Repo: repo, Number: number, Sessions: sessions, Requests: requests,
+			Output: output, CostUSD: cost, SharedSessions: share,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return Delivery{}, fmt.Errorf("derive: deliveries: %w", err)
+	}
+
+	for _, pr := range out.PullRequests {
+		out.TotalCostUSD += pr.CostUSD
+	}
+	sort.Slice(out.PullRequests, func(i, j int) bool {
+		return out.PullRequests[i].CostUSD > out.PullRequests[j].CostUSD
+	})
+
+	// Counted on distinct requests, so a session opening several pull requests
+	// contributes once rather than once per pull request.
+	var attributed, total int64
+	row := s.db.SQL().QueryRowContext(ctx, `
+		SELECT
+		  (SELECT count(DISTINCT request_id) FROM records
+		    WHERE request_id IS NOT NULL
+		      AND session_id IN (SELECT session_id FROM records WHERE pr_repo IS NOT NULL)),
+		  (SELECT count(DISTINCT request_id) FROM records WHERE request_id IS NOT NULL)`)
+	if err := row.Scan(&attributed, &total); err != nil {
+		return Delivery{}, fmt.Errorf("derive: count attributed requests: %w", err)
+	}
+	if total > 0 {
+		out.Attributed = float64(attributed) / float64(total)
+	}
+	return out, nil
 }
 
 // price fills in costs and the derived ratios.

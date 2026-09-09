@@ -74,6 +74,8 @@ func (w *Writer) Ingest(ctx context.Context, records []wire.Record) (wire.Ingest
 			CacheRead:    id.Usage.CacheRead,
 			CacheWrite5m: id.Usage.CacheWrite5m,
 			CacheWrite1h: id.Usage.CacheWrite1h,
+			PRRepo:       id.PRRepo,
+			PRNumber:     id.PRNumber,
 			Sealed:       sealed,
 		})
 	}

@@ -33,16 +33,17 @@ everything**. There is no server. Each node serves its own dashboard.
   including the cache-read/cache-write split — and what prompt caching actually saved you.
 - **Time.** Active coding time, busy hours, busy days, streaks, trends by day/week/month/year.
 - **Projects.** What you actually worked on over time, across every machine.
-- **Delivery.** Sessions joined to pull requests and issues: cost per merged PR, lead time,
-  AI-written lines versus total.
+- **Delivery.** Cost per pull request, joined exactly: the assistant records the pull
+  request each session opened, so this is not branch-name guessing. Where one session
+  produced several, its cost is split evenly between them and labelled as an allocation.
 - **Fleet health.** Which machines are reporting, and whether the archive has gaps.
 - **No account system.** You join a mesh by holding its key. That is the whole membership
   model.
 
 ## Status
 
-A single node works end to end: collect, store sealed, derive, and serve a dashboard. Peer
-discovery and sync are the next phase; until then, nodes are independent archives.
+Working end to end. Nodes collect, discover each other, converge both ways, bridge through
+external storage, and each serves its own dashboard.
 
 ## Quickstart
 
@@ -60,8 +61,22 @@ make build
 # Collect and serve.
 ./bin/agentic-stats run           # dashboard on http://127.0.0.1:8899
 ./bin/agentic-stats once          # or a single pass and exit
-./bin/agentic-stats status        # what this node holds
+./bin/agentic-stats status        # what this node holds, and its peers
 ```
+
+Nodes on the same network find each other automatically. For machines separated by a
+WireGuard or Tailscale tunnel, list them under `mesh.peers` -- multicast cannot cross a
+point-to-point link, so discovery genuinely cannot reach them. For machines that never share
+a network at all, point both at the same folder:
+
+```toml
+[bridge]
+kind = "filesystem"
+path = "~/Dropbox/agentic-stats"
+```
+
+Any synced folder, NAS or SMB share works. Bundles written there are encrypted, including
+their metadata, because the storage provider is not trusted.
 
 Open the dashboard and sign in with the mesh key. It shows cost, cache savings, the cache
 hit rate, cost per active day and a per-model breakdown; `/v1/summary` and `/v1/daily`

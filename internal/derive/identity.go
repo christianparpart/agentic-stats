@@ -20,6 +20,10 @@ type Identity struct {
 	RequestID string
 	// Model is empty unless this line carries usage.
 	Model string
+	// PRRepo and PRNumber are set on pr-link lines, which record the pull
+	// request a session produced.
+	PRRepo   string
+	PRNumber int64
 	// Usage is the token accounting for the request this line belongs to.
 	// Every line of a multi-block response repeats it verbatim, which is
 	// exactly why the fold exists.
@@ -44,6 +48,8 @@ type identityShape struct {
 	Timestamp string `json:"timestamp"`
 	RequestID string `json:"requestId"`
 	Type      string `json:"type"`
+	PRRepo    string `json:"prRepository"`
+	PRNumber  int64  `json:"prNumber"`
 	Message   struct {
 		Model string `json:"model"`
 		Usage *struct {
@@ -76,6 +82,9 @@ func Identify(raw []byte) Identity {
 		LineUUID:   s.UUID,
 		CapturedAt: s.Timestamp,
 		RequestID:  s.RequestID,
+	}
+	if s.Type == "pr-link" && s.PRRepo != "" && s.PRNumber > 0 {
+		id.PRRepo, id.PRNumber = s.PRRepo, s.PRNumber
 	}
 	// Synthetic error lines carry all-zero usage and no usable request id;
 	// excluding them here keeps them out of every cost calculation.

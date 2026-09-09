@@ -90,6 +90,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/logout", s.handleLogout)
 	mux.HandleFunc("GET /v1/summary", s.authenticated(s.handleSummary))
 	mux.HandleFunc("GET /v1/daily", s.authenticated(s.handleDaily))
+	mux.HandleFunc("GET /v1/delivery", s.authenticated(s.handleDelivery))
 	return mux
 }
 
@@ -201,6 +202,16 @@ func (s *Server) handleDaily(w http.ResponseWriter, r *http.Request) {
 	s.respond(w, http.StatusOK, map[string]any{"days": days})
 }
 
+func (s *Server) handleDelivery(w http.ResponseWriter, r *http.Request) {
+	delivery, err := s.derive.Deliveries(r.Context())
+	if err != nil {
+		s.log.Error("deliveries", "error", err)
+		s.fail(w, http.StatusInternalServerError, "delivery failed")
+		return
+	}
+	s.respond(w, http.StatusOK, delivery)
+}
+
 // newSessionToken returns an unguessable session identifier.
 func newSessionToken() (string, error) {
 	buf := make([]byte, 32)
@@ -236,6 +247,6 @@ func (s *Server) fail(w http.ResponseWriter, status int, message string) {
 func Describe() string {
 	return "routes: " + strings.Join([]string{
 		"GET /", "GET /healthz", "POST /v1/login", "POST /v1/logout",
-		"GET /v1/summary", "GET /v1/daily",
+		"GET /v1/summary", "GET /v1/daily", "GET /v1/delivery",
 	}, ", ")
 }

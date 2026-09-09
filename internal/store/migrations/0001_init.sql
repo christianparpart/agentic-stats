@@ -54,6 +54,13 @@ CREATE TABLE records (
     cache_write5m INTEGER NOT NULL DEFAULT 0,
     cache_write1h INTEGER NOT NULL DEFAULT 0,
 
+    -- Set on pr-link lines, which bind a session directly to a shipped pull
+    -- request. This is an exact attribution, not a heuristic: the assistant
+    -- recorded the PR it opened, so cost per merged PR is a join rather than
+    -- an estimate.
+    pr_repo       TEXT,
+    pr_number     INTEGER,
+
     sealed       BLOB    NOT NULL,
     received_at  TEXT    NOT NULL,
 
@@ -76,6 +83,8 @@ CREATE UNIQUE INDEX records_semantic_hash
     WHERE line_uuid IS NULL;
 
 CREATE INDEX records_captured ON records (captured_at);
+CREATE INDEX records_session  ON records (session_id) WHERE session_id IS NOT NULL;
+CREATE INDEX records_pr       ON records (pr_repo, pr_number) WHERE pr_repo IS NOT NULL;
 
 -- Serves the fold directly: one row per request, ordered so ties cannot occur.
 CREATE INDEX records_request ON records (request_id, origin_id, seq)

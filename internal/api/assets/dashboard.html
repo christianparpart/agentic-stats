@@ -186,6 +186,19 @@
     <div id="daily"></div>
   </section>
 
+  <section class="card" id="delivery-card">
+    <h2>Cost per pull request</h2>
+    <p class="cap" id="delivery-cap">Attributed exactly &mdash; the assistant recorded the pull
+      request each session opened, so this is a join rather than an estimate.</p>
+    <div id="delivery"></div>
+    <table id="pr-table">
+      <thead>
+        <tr><th>Pull request</th><th>Sessions</th><th>Requests</th><th>Output</th><th>Cost</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
   <section class="card">
     <h2>By model</h2>
     <p class="cap">Cost and requests per model. Bars are labelled directly; the table repeats every value.</p>
@@ -334,6 +347,61 @@ function tiles(s) {
     `<div class="value">${i.value}</div><div class="note">${i.note}</div></div>`).join("");
 }
 
+/* Horizontal bars, direct-labelled, one slot colour throughout: these are all
+   the same kind of thing, so colour carries no extra meaning here. */
+function deliveryView(d) {
+  const host = document.getElementById("delivery");
+  const cap = document.getElementById("delivery-cap");
+  const prs = (d && d.pull_requests) || [];
+  document.querySelector("#pr-table tbody").innerHTML = "";
+  if (!prs.length) {
+    host.innerHTML = '<p class="empty">No pull requests recorded yet. ' +
+      'They appear once a session opens one.</p>';
+    return;
+  }
+  cap.innerHTML = "Attributed exactly &mdash; the assistant recorded the pull request each " +
+    "session opened, so this is a join rather than an estimate. " +
+    `<strong>${(d.attributed * 100).toFixed(1)}%</strong> of all requests reached one; ` +
+    "the rest is exploration, reading and work that shipped nothing.";
+
+  const top = prs.slice(0, 12);
+  const rowH = 30, W = host.clientWidth || 900, H = top.length * rowH + 8;
+  const labelW = 240, iw = Math.max(60, W - labelW - 96);
+  const max = Math.max(...top.map(p => p.cost_usd)) || 1;
+  host.innerHTML = "";
+  const svg = el("svg", {viewBox: `0 0 ${W} ${H}`, role: "img",
+    "aria-label": "Cost per pull request"});
+
+  top.forEach((p, i) => {
+    const y = i * rowH + 6, bh = 16;
+    const w = Math.max(2, (p.cost_usd / max) * iw);
+    const r = Math.min(4, bh / 2, w);
+    const name = `${p.repo.split("/").pop()}#${p.number}`;
+    svg.appendChild(el("text", {x: 0, y: y + bh - 3, class: "bar-name"}, name));
+    svg.appendChild(el("path", {
+      d: `M${labelW},${y} L${labelW + w - r},${y} Q${labelW + w},${y} ${labelW + w},${y + r} ` +
+         `L${labelW + w},${y + bh - r} Q${labelW + w},${y + bh} ${labelW + w - r},${y + bh} L${labelW},${y + bh} Z`,
+      fill: `var(${SERIES[0]})`
+    }));
+    svg.appendChild(el("text", {x: labelW + w + 10, y: y + bh - 3, class: "bar-label"},
+      fmtUSD(p.cost_usd)));
+
+    const hit = el("rect", {x: 0, y: y - 3, width: W, height: rowH, class: "hit"});
+    hit.addEventListener("mousemove", e => showTip(e,
+      `<div class="t-val">${fmtUSD(p.cost_usd)}</div>` +
+      `<div class="t-sub">${p.repo}#${p.number} &middot; ${fmtInt(p.sessions)} sessions ` +
+      `&middot; ${fmtInt(p.requests)} requests</div>`));
+    hit.addEventListener("mouseleave", hideTip);
+    svg.appendChild(hit);
+  });
+  host.appendChild(svg);
+
+  document.querySelector("#pr-table tbody").innerHTML = prs.map(p =>
+    `<tr><td>${p.repo}#${p.number}</td><td>${fmtInt(p.sessions)}</td>` +
+    `<td>${fmtInt(p.requests)}</td><td>${fmtInt(p.output_tokens)}</td>` +
+    `<td>${fmtUSD(p.cost_usd)}</td></tr>`).join("");
+}
+
 function modelTable(models) {
   document.querySelector("#model-table tbody").innerHTML = models.map((m, i) =>
     `<tr><td><span class="swatch" style="background:var(${SERIES[i % SERIES.length]})"></span>${m.model}</td>` +
@@ -350,8 +418,10 @@ async function api(path, opts) {
 
 let lastData = null;
 async function load() {
-  const [summary, daily] = await Promise.all([api("/v1/summary"), api("/v1/daily")]);
-  lastData = {summary, daily};
+  const [summary, daily, delivery] = await Promise.all([
+    api("/v1/summary"), api("/v1/daily"), api("/v1/delivery"),
+  ]);
+  lastData = {summary, daily, delivery};
   document.getElementById("login").classList.add("hidden");
   document.getElementById("app").classList.remove("hidden");
   render();
@@ -359,13 +429,14 @@ async function load() {
 
 function render() {
   if (!lastData) return;
-  const {summary, daily} = lastData;
+  const {summary, daily, delivery} = lastData;
   tiles(summary);
   document.getElementById("scope").textContent =
     `${fmtInt(summary.lines)} archived lines · ${daily.days.length} active days`;
   dailyChart(document.getElementById("daily"), daily.days);
   modelChart(document.getElementById("models"), summary.models);
   modelTable(summary.models);
+  deliveryView(delivery);
 }
 
 function showLogin() {

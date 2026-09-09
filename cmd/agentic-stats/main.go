@@ -23,6 +23,8 @@ import (
 
 	"github.com/christianparpart/agentic-stats/internal/agentcfg"
 	"github.com/christianparpart/agentic-stats/internal/api"
+	"github.com/christianparpart/agentic-stats/internal/bridge"
+	"github.com/christianparpart/agentic-stats/internal/bridge/fsbackend"
 	"github.com/christianparpart/agentic-stats/internal/certs"
 	"github.com/christianparpart/agentic-stats/internal/collector"
 	"github.com/christianparpart/agentic-stats/internal/cursor"
@@ -158,6 +160,7 @@ type node struct {
 	derive *derive.Service
 	coll   *collector.Collector
 	mesh   *mesh.Mesh
+	bridge *bridge.Bridge
 	log    *slog.Logger
 	closes []func() error
 }
@@ -212,6 +215,9 @@ func openNodeWith(ctx context.Context, configPath, statePath string, log *slog.L
 	}
 
 	if err := n.buildMesh(keys, cfg, log); err != nil {
+		return nil, n.closeAll(err)
+	}
+	if err := n.buildBridge(keys, cfg, log); err != nil {
 		return nil, n.closeAll(err)
 	}
 	if parts == readOnly {
@@ -274,6 +280,32 @@ func (n *node) buildMesh(keys *seal.Keys, cfg agentcfg.Config, log *slog.Logger)
 	}
 	n.mesh = m
 	return nil
+}
+
+// buildBridge wires the external storage bridge, if one is configured.
+func (n *node) buildBridge(keys *seal.Keys, cfg agentcfg.Config, log *slog.Logger) error {
+	switch cfg.Bridge.Kind {
+	case "":
+		return nil
+	case "filesystem":
+		if cfg.Bridge.Path == "" {
+			return errors.New("bridge.path is required for the filesystem backend")
+		}
+		be, err := fsbackend.New(cfg.Bridge.Path)
+		if err != nil {
+			return err
+		}
+		b, err := bridge.New(bridge.Config{
+			Backend: be, Store: n.db, Keys: keys, Logger: log,
+		})
+		if err != nil {
+			return err
+		}
+		n.bridge = b
+		return nil
+	default:
+		return fmt.Errorf("unknown bridge.kind %q (known: filesystem)", cfg.Bridge.Kind)
+	}
 }
 
 // isLoopback reports whether a listen address is loopback-only.
@@ -426,6 +458,10 @@ func runNode(args []string, defaultPath string, m mode) error {
 		}()
 	}
 
+	if n.bridge != nil {
+		go n.runBridge(ctx, log)
+	}
+
 	poll := *interval
 	if poll <= 0 {
 		if poll, err = time.ParseDuration(n.cfg.Agent.PollInterval); err != nil {
@@ -513,6 +549,39 @@ func runStatus(args []string, defaultPath string) error {
 		fmt.Println("cloned VM or a copied database. Their data is being kept, not merged.")
 	}
 	return nil
+}
+
+// runBridge publishes to and fetches from external storage on an interval.
+//
+// A failure is logged and retried rather than fatal: a bridge folder living on
+// a network share or a sync client is expected to be intermittently absent.
+func (n *node) runBridge(ctx context.Context, log *slog.Logger) {
+	every := 5 * time.Minute
+	if n.cfg.Bridge.Interval != "" {
+		if parsed, err := time.ParseDuration(n.cfg.Bridge.Interval); err == nil {
+			every = parsed
+		} else {
+			log.Warn("parse bridge.interval; using the default", "error", err)
+		}
+	}
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		stats, err := n.bridge.Sync(ctx)
+		switch {
+		case err != nil:
+			log.Warn("bridge sync failed", "error", err)
+		case stats.Published > 0 || stats.Stored > 0 || stats.Forked > 0:
+			log.Info("bridge sync",
+				"published", stats.Published, "fetched", stats.Fetched,
+				"stored", stats.Stored, "forked", stats.Forked)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 // reportPass logs the outcome of one collection pass.

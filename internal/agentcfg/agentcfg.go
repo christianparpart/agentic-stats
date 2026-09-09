@@ -20,6 +20,20 @@ type Config struct {
 	Dashboard DashboardConfig `toml:"dashboard"`
 	Agent     AgentConfig     `toml:"agent"`
 	Privacy   PrivacyConfig   `toml:"privacy"`
+	Bridge    BridgeConfig    `toml:"bridge"`
+}
+
+// BridgeConfig carries records through storage both machines can reach, for
+// machines that never share a network.
+type BridgeConfig struct {
+	// Kind selects a backend. Empty disables the bridge. "filesystem" is the
+	// only one implemented; the interface takes others.
+	Kind string `toml:"kind"`
+	// Path is the directory for the filesystem backend. Point two machines at
+	// the same Dropbox, iCloud or NAS folder and they bridge.
+	Path string `toml:"path"`
+	// Interval is how often to publish and fetch, as a duration string.
+	Interval string `toml:"interval"`
 }
 
 // MeshConfig holds the shared secret and how peers are found.

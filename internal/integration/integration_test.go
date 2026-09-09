@@ -272,3 +272,114 @@ func TestReplicasWithTheSameKeyAgree(t *testing.T) {
 		t.Error("the replica derived no cost; the records did not survive the trip")
 	}
 }
+
+// prLink is the line the assistant writes when it opens a pull request.
+func prLink(session, repo string, number int) string {
+	return fmt.Sprintf(`{"type":"pr-link","sessionId":%q,"prRepository":%q,"prNumber":%d,`+
+		`"timestamp":"2026-09-08T12:00:00.000Z"}`, session, repo, number)
+}
+
+// sessionLine is an assistant response belonging to a named session.
+func sessionLine(session, requestID string, output int64) string {
+	return fmt.Sprintf(`{"type":"assistant","requestId":%q,"uuid":%q,"sessionId":%q,`+
+		`"timestamp":"2026-09-08T12:00:00.000Z","message":{"model":"claude-opus-5",`+
+		`"usage":{"input_tokens":10,"output_tokens":%d,"cache_read_input_tokens":100,`+
+		`"output_tokens_details":{"thinking_tokens":5},`+
+		`"cache_creation":{"ephemeral_5m_input_tokens":10,"ephemeral_1h_input_tokens":0}}}}`,
+		requestID, requestID+"-u", session, output)
+}
+
+// A session that opens several pull requests must have its cost split between
+// them, not counted once per pull request. Counting it whole against each is
+// the same double-count the requestId fold exists to prevent, arriving from a
+// different direction.
+func TestCostIsSplitAcrossSharedSessions(t *testing.T) {
+	n := newNode(t)
+	ctx := context.Background()
+
+	// One session, three pull requests.
+	batch := records(
+		sessionLine("busy-session", "req-1", 1000),
+		sessionLine("busy-session", "req-2", 1000),
+		prLink("busy-session", "acme/widgets", 1),
+		prLink("busy-session", "acme/widgets", 2),
+		prLink("busy-session", "acme/widgets", 3),
+		// A second session with a single pull request, for contrast.
+		sessionLine("focused-session", "req-3", 600),
+		prLink("focused-session", "acme/widgets", 4),
+	)
+	if _, err := n.writer.Ingest(ctx, batch); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+
+	d, err := n.derive.Deliveries(ctx)
+	if err != nil {
+		t.Fatalf("Deliveries: %v", err)
+	}
+	if len(d.PullRequests) != 4 {
+		t.Fatalf("attributed %d pull requests, want 4", len(d.PullRequests))
+	}
+
+	sum, err := n.derive.Summarize(ctx)
+	if err != nil {
+		t.Fatalf("Summarize: %v", err)
+	}
+
+	// The headline property: allocation must never exceed what was spent.
+	if d.TotalCostUSD > sum.TotalCostUSD+1e-9 {
+		t.Errorf("allocated $%.6f across pull requests but only $%.6f was spent",
+			d.TotalCostUSD, sum.TotalCostUSD)
+	}
+	if d.Attributed > 1.0 {
+		t.Errorf("attributed share = %.3f, want at most 1.0", d.Attributed)
+	}
+
+	byNumber := map[int64]float64{}
+	shared := map[int64]int64{}
+	for _, pr := range d.PullRequests {
+		byNumber[pr.Number] = pr.CostUSD
+		shared[pr.Number] = pr.SharedSessions
+	}
+	// The three pull requests from one session must each carry a third.
+	for _, n := range []int64{1, 2, 3} {
+		if shared[n] == 0 {
+			t.Errorf("pull request %d should be marked as sharing its session", n)
+		}
+	}
+	if a, b := byNumber[1], byNumber[2]; a <= 0 || a != b {
+		t.Errorf("shared pull requests carry %v and %v, want an equal split", a, b)
+	}
+	if shared[4] != 0 {
+		t.Error("pull request 4 had a session to itself and must not be marked shared")
+	}
+	// The three shares must reconstitute the whole session: splitting must
+	// redistribute cost, never destroy or invent it.
+	whole := byNumber[1] + byNumber[2] + byNumber[3]
+	if whole <= 0 {
+		t.Fatal("the shared session contributed no cost at all")
+	}
+	perShare := whole / 3
+	for _, n := range []int64{1, 2, 3} {
+		if diff := byNumber[n] - perShare; diff > 1e-9 || diff < -1e-9 {
+			t.Errorf("pull request %d carries $%.6f, want an even third at $%.6f",
+				n, byNumber[n], perShare)
+		}
+	}
+}
+
+// With no pull requests recorded the view must be empty rather than wrong.
+func TestDeliveriesAreEmptyWithoutPullRequests(t *testing.T) {
+	n := newNode(t)
+	ctx := context.Background()
+	if _, err := n.writer.Ingest(ctx, records(
+		assistantLine("req-1", "claude-opus-5", 100, 10))); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	d, err := n.derive.Deliveries(ctx)
+	if err != nil {
+		t.Fatalf("Deliveries: %v", err)
+	}
+	if len(d.PullRequests) != 0 || d.TotalCostUSD != 0 || d.Attributed != 0 {
+		t.Errorf("expected an empty delivery view, got %+v", d)
+	}
+}
