@@ -3,10 +3,12 @@ package store
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"time"
 )
 
@@ -318,4 +320,60 @@ func (db *DB) Quarantined(ctx context.Context) (int64, error) {
 		return 0, fmt.Errorf("store: count quarantine: %w", err)
 	}
 	return n, nil
+}
+
+// BucketSize is how many sequence numbers one digest covers.
+const BucketSize = 1000
+
+// Digests returns a content digest per sequence bucket for one origin,
+// formatted as "count:hash".
+//
+// A version vector says "I have everything up to N" but never verifies it, so
+// two replicas that disagree *within* a range they both claim -- a corrupted
+// page, or two machines issuing different records under one origin id -- look
+// identical to it. Comparing digests catches that for roughly one percent of
+// the cost of a Merkle tree: a mismatched bucket means re-send that thousand.
+//
+// The count is part of the value because two nodes disagree for two very
+// different reasons. Different counts mean one side is simply behind, which is
+// ordinary. The same count with a different hash means they hold *different*
+// records at the same positions, which is divergence and must be surfaced.
+func (db *DB) Digests(ctx context.Context, origin string) (map[int64]string, error) {
+	rows, err := db.sql.QueryContext(ctx, `
+		SELECT (seq - 1) / ?, seq, content_hash
+		  FROM records
+		 WHERE origin_id = ?
+		 ORDER BY seq`, BucketSize, origin)
+	if err != nil {
+		return nil, fmt.Errorf("store: read digests: %w", err)
+	}
+	defer func() { _ = rows.Close() }() // rows fully drained below
+
+	acc := make(map[int64]hash.Hash)
+	counts := make(map[int64]int)
+	for rows.Next() {
+		var bucket, seq int64
+		var contentHash string
+		if err := rows.Scan(&bucket, &seq, &contentHash); err != nil {
+			return nil, fmt.Errorf("store: scan digest row: %w", err)
+		}
+		h, ok := acc[bucket]
+		if !ok {
+			h = sha256.New()
+			acc[bucket] = h
+		}
+		// Sequence and hash both feed the digest, so a record appearing at the
+		// wrong position is as visible as wrong content.
+		fmt.Fprintf(h, "%d:%s\n", seq, contentHash)
+		counts[bucket]++
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: read digests: %w", err)
+	}
+
+	out := make(map[int64]string, len(acc))
+	for bucket, h := range acc {
+		out[bucket] = fmt.Sprintf("%d:%s", counts[bucket], hex.EncodeToString(h.Sum(nil)))
+	}
+	return out, nil
 }
