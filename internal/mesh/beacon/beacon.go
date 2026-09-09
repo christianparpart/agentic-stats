@@ -119,7 +119,7 @@ func New(cfg Config) (*Beacon, error) {
 
 // Run announces and listens until ctx is done, reporting peers to found.
 func (b *Beacon) Run(ctx context.Context, found func(Peer)) error {
-	var lc net.ListenConfig
+	lc := net.ListenConfig{Control: reuseControl}
 	conn, err := lc.ListenPacket(ctx, "udp4", fmt.Sprintf("0.0.0.0:%d", Port))
 	if err != nil {
 		return fmt.Errorf("beacon: listen: %w", err)
@@ -131,7 +131,11 @@ func (b *Beacon) Run(ctx context.Context, found func(Peer)) error {
 	if err := pc.SetMulticastTTL(1); err != nil {
 		b.log.Warn("set multicast ttl", "error", err)
 	}
-	if err := pc.SetMulticastLoopback(false); err != nil {
+	// Loopback stays ON. Our own beacons are already dropped by node id, and
+	// disabling it would also stop two nodes on one host from seeing each
+	// other -- a machine and the VM running on it, which is a real deployment
+	// and not merely a test arrangement.
+	if err := pc.SetMulticastLoopback(true); err != nil {
 		b.log.Debug("set multicast loopback", "error", err)
 	}
 
