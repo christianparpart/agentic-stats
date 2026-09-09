@@ -363,8 +363,10 @@ func (db *DB) Digests(ctx context.Context, origin string) (map[int64]string, err
 			acc[bucket] = h
 		}
 		// Sequence and hash both feed the digest, so a record appearing at the
-		// wrong position is as visible as wrong content.
-		fmt.Fprintf(h, "%d:%s\n", seq, contentHash)
+		// wrong position is as visible as wrong content. hash.Hash never
+		// reports an error from Write, which is why the interface documents
+		// it as such.
+		_, _ = fmt.Fprintf(h, "%d:%s\n", seq, contentHash)
 		counts[bucket]++
 	}
 	if err := rows.Err(); err != nil {

@@ -153,11 +153,12 @@ func TestTLSTerminatingRelayIsDefeated(t *testing.T) {
 		}
 		defer func() { _ = front.Close() }()
 
-		back, err := tls.Dial("tcp", realListener.Addr().String(), &tls.Config{
+		dialer := &tls.Dialer{Config: &tls.Config{
 			MinVersion:         tls.VersionTLS13,
 			InsecureSkipVerify: true,
 			NextProtos:         []string{"agentic-stats/1"},
-		})
+		}}
+		back, err := dialer.DialContext(context.Background(), "tcp", realListener.Addr().String())
 		if err != nil {
 			return
 		}
