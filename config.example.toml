@@ -1,7 +1,10 @@
 # agentic-stats configuration — EXAMPLE
 #
-# Copy to ~/.config/agentic-stats/config.toml, or let `agentic-stats init`
-# write it for you. The real file holds the mesh key and is gitignored.
+# Let `agentic-stats init` write this for you, or copy it to
+# agentic-stats/config.toml inside your user config directory: ~/.config on
+# Linux, ~/Library/Application Support on macOS, %AppData% on Windows.
+# `agentic-stats --help` prints the resolved path. The real file holds the
+# mesh key and is gitignored.
 
 [mesh]
 # The one secret. It admits this machine to the mesh, encrypts every record,

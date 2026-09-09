@@ -42,7 +42,7 @@ func TestEnvironmentOverridesFile(t *testing.T) {
 }
 
 func TestSaveRoundTrips(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "nested", "agent.toml")
+	path := filepath.Join(t.TempDir(), "nested", "config.toml")
 	want := agentcfg.Config{
 		Mesh:      agentcfg.MeshConfig{PSK: "a-key", Listen: ":8844", Discovery: true},
 		Dashboard: agentcfg.DashboardConfig{Listen: "127.0.0.1:9000"},
@@ -67,7 +67,7 @@ func TestSaveRoundTrips(t *testing.T) {
 
 // The file holds a device token, so its mode is a security property.
 func TestSaveWritesOwnerOnlyPermissions(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "agent.toml")
+	path := filepath.Join(t.TempDir(), "config.toml")
 	if err := agentcfg.Save(path, agentcfg.Config{
 		Mesh: agentcfg.MeshConfig{PSK: "secret"},
 	}); err != nil {

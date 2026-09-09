@@ -84,7 +84,7 @@ func DefaultPath() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("agentcfg: locate config dir: %w", err)
 	}
-	return filepath.Join(dir, "agentic-stats", "agent.toml"), nil
+	return filepath.Join(dir, "agentic-stats", "config.toml"), nil
 }
 
 // Load reads configuration from path, applying environment overrides.
