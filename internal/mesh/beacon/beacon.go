@@ -393,13 +393,27 @@ func (b *Beacon) localAddrs() []string {
 	var out []string
 	for _, a := range addrs {
 		ipnet, ok := a.(*net.IPNet)
-		if !ok || ipnet.IP.IsLoopback() || ipnet.IP.To4() == nil {
+		if !ok || ipnet.IP.To4() == nil || !routable(ipnet.IP) {
 			continue
 		}
 		out = append(out, ipnet.IP.String())
 	}
 	slices.Sort(out)
 	return out
+}
+
+// routable reports whether an address is worth announcing to peers.
+//
+// A machine with Hyper-V, WSL or a disconnected adapter carries a handful of
+// 169.254 addresses it can never be reached on. Announcing them is not
+// harmless: every peer stores them, and every sweep spends a dial attempt on
+// each before it reaches the address that works, which sorts last.
+func routable(ip net.IP) bool {
+	return !ip.IsLoopback() &&
+		!ip.IsLinkLocalUnicast() &&
+		!ip.IsLinkLocalMulticast() &&
+		!ip.IsUnspecified() &&
+		!ip.IsMulticast()
 }
 
 // joinAddrs renders addresses for the tag, so a forged address list cannot

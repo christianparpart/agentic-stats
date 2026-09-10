@@ -203,3 +203,34 @@ func TestNewRequiresItsDependencies(t *testing.T) {
 		t.Error("expected an error when NodeID is missing")
 	}
 }
+
+// A machine with Hyper-V, WSL or a disconnected adapter carries addresses it
+// can never be reached on. Announcing them costs every peer a stored address
+// and a wasted dial attempt on every sweep, ahead of the one that works.
+func TestOnlyRoutableAddressesAreAnnounced(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ip   string
+		want bool
+	}{
+		{"ordinary LAN address", "192.168.86.51", true},
+		{"private range", "10.11.12.2", true},
+		{"container bridge is still dialable", "172.30.32.1", true},
+		{"APIPA from a disconnected adapter", "169.254.100.26", false},
+		{"link-local boundary, low", "169.254.0.1", false},
+		{"link-local boundary, high", "169.254.255.254", false},
+		{"loopback", "127.0.0.1", false},
+		{"unspecified", "0.0.0.0", false},
+		{"multicast", "239.7.7.7", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ip := net.ParseIP(tc.ip)
+			if ip == nil {
+				t.Fatalf("ParseIP(%q) returned nil", tc.ip)
+			}
+			if got := routable(ip); got != tc.want {
+				t.Errorf("routable(%s) = %v, want %v", tc.ip, got, tc.want)
+			}
+		})
+	}
+}
