@@ -1093,5 +1093,19 @@ func peerLabel(p mesh.PeerHealth) string {
 	if p.Host == "" {
 		return p.ID
 	}
-	return p.Host + " (" + p.ID[:8] + ")"
+	return p.Host + " (" + shortID(p.ID) + ")"
+}
+
+// shortID is the leading run of an origin id, enough to tell two apart.
+//
+// Length-checked because the handshake only requires a peer's id to be
+// non-empty, not to be the 32 hex characters this node mints: a peer is
+// authenticated by the mesh key, and nothing binds the id it claims to that
+// key. A report is the wrong place to discover that.
+func shortID(id string) string {
+	const short = 8
+	if len(id) <= short {
+		return id
+	}
+	return id[:short]
 }
