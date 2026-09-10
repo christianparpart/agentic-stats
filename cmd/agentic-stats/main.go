@@ -44,10 +44,13 @@ import (
 	"github.com/christianparpart/agentic-stats/internal/source/claudecode"
 	"github.com/christianparpart/agentic-stats/internal/store"
 	"github.com/christianparpart/agentic-stats/internal/supervise"
+	"github.com/christianparpart/agentic-stats/internal/version"
 )
 
-// version identifies the build. Overridden at release time via -ldflags.
-var version = "dev"
+// buildVersion identifies the build, stamped at link time with
+// -X main.buildVersion. Named for the linker flag rather than plain "version"
+// so it does not shadow the package that gives it meaning.
+var buildVersion = "dev"
 
 const usage = `agentic-stats %s
 
@@ -57,6 +60,7 @@ Usage:
   agentic-stats once     Collect once and exit
   agentic-stats run      Collect continuously and serve the dashboard
   agentic-stats status   Report what this node holds
+  agentic-stats version  Report this build
 
   agentic-stats reprocess  Re-read archived records for columns this build
                            extracts and older ones did not
@@ -85,12 +89,22 @@ func main() {
 }
 
 func run(args []string) error {
+	// Before the configuration path is resolved, because reporting the build
+	// needs nothing from the environment and must not fail with it. Locating
+	// the config directory needs $XDG_CONFIG_HOME or $HOME, which a minimal
+	// container or a unit file without Environment=HOME= does not set -- and
+	// `version` is exactly what an installer or a "is this node behind?" probe
+	// runs first, where an exit 1 reads as a broken binary.
+	if len(args) > 0 && (args[0] == "version" || args[0] == "--version") {
+		return runVersion()
+	}
+
 	defaultPath, err := agentcfg.DefaultPath()
 	if err != nil {
 		return err
 	}
 	if len(args) == 0 {
-		fmt.Printf(usage, version, defaultPath)
+		fmt.Printf(usage, buildVersion, defaultPath)
 		return errors.New("no command given")
 	}
 	switch args[0] {
@@ -119,11 +133,30 @@ func run(args []string) error {
 	case "restart":
 		return runServiceControl(args[1:], serviceRestart)
 	case "-h", "--help", "help":
-		fmt.Printf(usage, version, defaultPath)
+		fmt.Printf(usage, buildVersion, defaultPath)
 		return nil
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+// runVersion reports what this build is.
+//
+// A version is only useful next to the platform it was built for, because the
+// two together name the artifact a node would have to fetch to become this
+// build -- which is the question the fleet asks when it notices a node is
+// behind.
+func runVersion() error {
+	v := version.Parse(buildVersion)
+	// Marked inline rather than explained in a second line: what a released
+	// build means for the fleet is not settled yet, and a one-line command
+	// should not describe behaviour that is still being built.
+	unreleased := ""
+	if !v.IsRelease() {
+		unreleased = " (unreleased)"
+	}
+	fmt.Printf("agentic-stats %s %s/%s%s\n", v, runtime.GOOS, runtime.GOARCH, unreleased)
+	return nil
 }
 
 // runInit generates a mesh key, or adopts the one supplied.
@@ -674,7 +707,7 @@ func (n *node) serveDashboard(ctx context.Context, addr, configPath string, log 
 		scheme = "https"
 	}
 	log.Info("dashboard listening",
-		"url", scheme+"://"+addr, "origin", n.db.OriginID(), "version", version)
+		"url", scheme+"://"+addr, "origin", n.db.OriginID(), "version", buildVersion)
 	log.Info(api.Describe())
 	if useTLS && n.cfg.Dashboard.TLSCert == "" {
 		log.Warn("using a self-signed certificate; your browser will warn once " +
