@@ -34,6 +34,23 @@ const maxBackoff = 15 * time.Minute
 // dialTimeout bounds one peer exchange.
 const dialTimeout = 5 * time.Minute
 
+// exchangeTimeout bounds an exchange a peer opened against us.
+//
+// Inbound previously carried the daemon's own lifetime as its context, so a
+// peer that connected and then stalled held a goroutine and a connection until
+// the process exited. Outbound had dialTimeout; this is its counterpart. It is
+// generous because a first backfill between two long-lived nodes is genuinely
+// large, and the idle deadline inside the connection is what catches a peer
+// that has stopped making progress.
+const exchangeTimeout = 30 * time.Minute
+
+// maxInboundExchanges caps concurrent inbound convergence.
+//
+// A fleet is a handful of machines, so this is far above any legitimate load;
+// it exists so that a peer opening connections in a loop costs a bounded amount
+// of memory and database contention rather than an unbounded amount.
+const maxInboundExchanges = 8
+
 // Config is everything the mesh needs.
 type Config struct {
 	Store  *store.DB
@@ -192,6 +209,12 @@ func (m *Mesh) discovered(p beacon.Peer) {
 
 // accept converges with every peer that connects to us.
 func (m *Mesh) accept(ctx context.Context, l *channel.Listener) {
+	inFlight := make(chan struct{}, maxInboundExchanges)
+	var wg sync.WaitGroup
+	// Inbound exchanges borrow the accept loop's lifetime, so they must finish
+	// before it returns or they would write to a closing store.
+	defer wg.Wait()
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return
@@ -204,7 +227,25 @@ func (m *Mesh) accept(ctx context.Context, l *channel.Listener) {
 			m.log.Debug("accept", "error", err)
 			continue
 		}
-		go m.exchange(ctx, conn, "inbound")
+		select {
+		case inFlight <- struct{}{}:
+		default:
+			// Already converging with as many peers as we are willing to. The
+			// peer will try again on its own sweep; refusing now is cheaper for
+			// both of us than queueing.
+			m.log.Warn("refusing inbound exchange; already at capacity",
+				"peer", conn.PeerNodeID, "limit", maxInboundExchanges)
+			_ = conn.Close()
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-inFlight }()
+			exCtx, cancel := context.WithTimeout(ctx, exchangeTimeout)
+			defer cancel()
+			m.exchange(exCtx, conn, "inbound")
+		}()
 	}
 }
 
@@ -264,6 +305,10 @@ func (m *Mesh) dialAndSync(ctx context.Context, addr string) bool {
 // exchange converges over an established connection and records the peer.
 func (m *Mesh) exchange(ctx context.Context, conn *channel.Conn, label string) {
 	defer func() { _ = conn.Close() }() // one exchange per connection
+
+	// Without this, cancelling ctx does not reach a read already blocked in the
+	// kernel, and the timeouts above would bound nothing.
+	defer conn.Guard(ctx)()
 
 	if conn.PeerNodeID == m.nodeID {
 		// Ourselves, reached through a loopback route or a duplicated

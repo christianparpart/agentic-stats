@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/christianparpart/agentic-stats/internal/certs"
@@ -39,6 +40,44 @@ const exporterLength = 32
 // handshakeTimeout bounds the authentication exchange.
 const handshakeTimeout = 20 * time.Second
 
+// DefaultIdleTimeout bounds a single read or write once the connection is up.
+//
+// It is an idle timeout, not a total one: every operation that makes progress
+// pushes it out again, so a multi-hour first backfill over a slow link is fine
+// while a peer that has stopped speaking is not. A total deadline would have to
+// be set to the worst imaginable sync and would therefore bound nothing useful.
+const DefaultIdleTimeout = 60 * time.Second
+
+// maxPendingHandshakes bounds authentications in flight.
+//
+// Authentication used to run inline in the accept loop, so one peer that
+// completed TCP and then went quiet blocked every other peer for the whole
+// handshake timeout. A port scanner did the same thing for free. Handshakes now
+// run concurrently, and this caps how many can be pinned open at once; past the
+// cap connections are dropped rather than queued, because queueing them is the
+// same denial with extra memory.
+//
+// The number is deliberately far above a real fleet, because the cap bounds
+// memory and not fairness. Every occupied slot is unavailable to a legitimate
+// peer until its handshake times out, so a tight cap would turn a handful of
+// stalled sockets into an outage for everyone else. A pending handshake costs
+// little, so the generous figure is close to free.
+const maxPendingHandshakes = 64
+
+// keepAlive reaps the half-open connections a suspend leaves behind.
+//
+// When a laptop sleeps or a VM is suspended mid-exchange, its peer is left
+// holding a socket that will never produce another byte and never signal a
+// close. Without probes it lingers until the operating system's own default
+// expires, which is measured in hours and differs on each of the three
+// platforms this ships to. Probing settles it in about a minute, everywhere.
+var keepAlive = net.KeepAliveConfig{
+	Enable:   true,
+	Idle:     30 * time.Second,
+	Interval: 10 * time.Second,
+	Count:    3,
+}
+
 // greeting is what each side sends once TLS is up.
 type greeting struct {
 	NodeID string `json:"node_id"`
@@ -54,14 +93,102 @@ type Config struct {
 	// Certificate is presented by the listener. Zero generates an ephemeral
 	// one, which is correct here: the certificate is not the trust anchor.
 	Certificate *tls.Certificate
+	// IdleTimeout bounds one read or write. Zero uses DefaultIdleTimeout.
+	IdleTimeout time.Duration
+}
+
+// idleTimeout resolves the configured bound.
+func (c Config) idleTimeout() time.Duration {
+	if c.IdleTimeout > 0 {
+		return c.IdleTimeout
+	}
+	return DefaultIdleTimeout
 }
 
 // Conn is an authenticated connection to a peer.
+//
+// Read and Write are overridden to carry an idle deadline, so a peer that stops
+// speaking mid-exchange fails in DefaultIdleTimeout rather than parking a
+// goroutine until TCP gives up. Callers see an ordinary io.ReadWriter and need
+// to know none of this.
 type Conn struct {
 	net.Conn
 	// PeerNodeID is the peer's replication identity, proven only to the extent
 	// that the peer holds the mesh key.
 	PeerNodeID string
+
+	idle time.Duration
+	// guard, once set by Guard, is consulted before and after every operation.
+	// It is written once before any I/O begins and never again.
+	guard context.Context
+}
+
+// Guard makes ctx able to interrupt this connection, returning a stop function.
+//
+// A socket read blocked in the kernel does not observe context cancellation:
+// the only thing that interrupts it is a deadline. Without this, cancelling the
+// exchange context on shutdown or timeout leaves the read parked exactly as it
+// was, which is the difference between a daemon that stops when asked and one
+// that has to be killed.
+//
+// Call it before any I/O, and call the returned stop when the exchange is done
+// so the watchdog goroutine does not outlive it.
+func (c *Conn) Guard(ctx context.Context) (stop func()) {
+	c.guard = ctx
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			// A deadline in the past unblocks whatever is waiting, and Read and
+			// Write then report the context's cause rather than a bare timeout.
+			_ = c.Conn.SetDeadline(time.Now())
+		case <-done:
+		}
+	}()
+	return func() { close(done) }
+}
+
+// Read refreshes the idle deadline and reads.
+func (c *Conn) Read(p []byte) (int, error) {
+	if err := c.before(c.Conn.SetReadDeadline); err != nil {
+		return 0, err
+	}
+	n, err := c.Conn.Read(p)
+	return n, c.after(err)
+}
+
+// Write refreshes the idle deadline and writes.
+func (c *Conn) Write(p []byte) (int, error) {
+	if err := c.before(c.Conn.SetWriteDeadline); err != nil {
+		return 0, err
+	}
+	n, err := c.Conn.Write(p)
+	return n, c.after(err)
+}
+
+// before pushes the idle deadline out for one operation.
+func (c *Conn) before(set func(time.Time) error) error {
+	if c.guard != nil {
+		if err := c.guard.Err(); err != nil {
+			return err
+		}
+	}
+	return set(time.Now().Add(c.idle))
+}
+
+// after reports the cancellation cause in place of the timeout it produced.
+//
+// Guard cancels by moving the deadline into the past, so the error surfacing
+// from the socket is a timeout no matter why it was cancelled. Reporting that
+// verbatim would make an orderly shutdown look like an unresponsive peer.
+func (c *Conn) after(err error) error {
+	if err == nil || c.guard == nil {
+		return err
+	}
+	if cause := c.guard.Err(); cause != nil {
+		return cause
+	}
+	return err
 }
 
 // Dialer opens authenticated connections.
@@ -97,7 +224,10 @@ func (d *Dialer) Dial(ctx context.Context, addr string) (*Conn, error) {
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"agentic-stats/1"},
 	}
-	dialer := &tls.Dialer{Config: tlsCfg}
+	dialer := &tls.Dialer{
+		NetDialer: &net.Dialer{KeepAliveConfig: keepAlive},
+		Config:    tlsCfg,
+	}
 	raw, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("channel: dial %s: %w", addr, err)
@@ -110,13 +240,19 @@ func (d *Dialer) Dial(ctx context.Context, addr string) (*Conn, error) {
 	if err != nil {
 		return nil, errors.Join(err, conn.Close())
 	}
-	return &Conn{Conn: conn, PeerNodeID: peer}, nil
+	return &Conn{Conn: conn, PeerNodeID: peer, idle: d.cfg.idleTimeout()}, nil
 }
 
 // Listener accepts authenticated connections.
+//
+// Handshakes run off the accept loop, so a peer that connects and then says
+// nothing delays only itself.
 type Listener struct {
-	inner net.Listener
-	cfg   Config
+	inner  net.Listener
+	cfg    Config
+	ready  chan *Conn
+	closed chan struct{}
+	once   sync.Once
 }
 
 // Listen binds addr and authenticates everything accepted on it.
@@ -137,44 +273,96 @@ func Listen(cfg Config, addr string) (*Listener, error) {
 		Certificates: []tls.Certificate{*cert},
 		NextProtos:   []string{"agentic-stats/1"},
 	}
-	inner, err := tls.Listen("tcp", addr, tlsCfg)
+	// KeepAliveConfig here covers the accepted side; the dialer sets its own.
+	lc := net.ListenConfig{KeepAliveConfig: keepAlive}
+	base, err := lc.Listen(context.Background(), "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("channel: listen %s: %w", addr, err)
 	}
-	return &Listener{inner: inner, cfg: cfg}, nil
+	l := &Listener{
+		inner:  tls.NewListener(base, tlsCfg),
+		cfg:    cfg,
+		ready:  make(chan *Conn),
+		closed: make(chan struct{}),
+	}
+	go l.serve()
+	return l, nil
 }
 
 // Addr reports the bound address.
 func (l *Listener) Addr() net.Addr { return l.inner.Addr() }
 
 // Close stops accepting.
-func (l *Listener) Close() error { return l.inner.Close() }
+func (l *Listener) Close() error {
+	l.once.Do(func() { close(l.closed) })
+	return l.inner.Close()
+}
 
-// Accept returns the next authenticated connection.
-//
-// A peer that fails authentication is closed and skipped rather than surfaced,
-// so a caller cannot accidentally use one.
-func (l *Listener) Accept(ctx context.Context) (*Conn, error) {
+// serve accepts connections and authenticates them concurrently.
+func (l *Listener) serve() {
+	pending := make(chan struct{}, maxPendingHandshakes)
 	for {
 		raw, err := l.inner.Accept()
 		if err != nil {
-			return nil, fmt.Errorf("channel: accept: %w", err)
+			// Close is the ordinary reason to land here; anything else has
+			// already broken the listener, and Accept reports it to the caller.
+			return
 		}
-		conn, ok := raw.(*tls.Conn)
-		if !ok {
+		select {
+		case pending <- struct{}{}:
+		default:
+			// Shedding load beats queueing it: a caller holding the cap open is
+			// exactly the caller we do not want to allocate for.
 			_ = raw.Close()
 			continue
 		}
-		peer, err := authenticate(ctx, conn, l.cfg, "server")
-		if err != nil {
-			_ = conn.Close()
-			if errors.Is(err, ErrNotInMesh) {
-				// Expected: someone else's mesh, or a port scanner.
-				continue
+		go func() {
+			defer func() { <-pending }()
+			conn := l.authenticated(raw)
+			if conn == nil {
+				return
 			}
-			continue
-		}
-		return &Conn{Conn: conn, PeerNodeID: peer}, nil
+			select {
+			case l.ready <- conn:
+			case <-l.closed:
+				_ = conn.Close()
+			}
+		}()
+	}
+}
+
+// authenticated completes one handshake, returning nil for anything that fails.
+//
+// A peer that fails authentication is closed and dropped rather than surfaced,
+// so a caller cannot accidentally use one.
+func (l *Listener) authenticated(raw net.Conn) *Conn {
+	conn, ok := raw.(*tls.Conn)
+	if !ok {
+		_ = raw.Close()
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), handshakeTimeout)
+	defer cancel()
+
+	peer, err := authenticate(ctx, conn, l.cfg, "server")
+	if err != nil {
+		// Someone else's mesh, a port scanner, or a half-open connection: all
+		// expected, none worth a log line at this level.
+		_ = conn.Close()
+		return nil
+	}
+	return &Conn{Conn: conn, PeerNodeID: peer, idle: l.cfg.idleTimeout()}
+}
+
+// Accept returns the next authenticated connection.
+func (l *Listener) Accept(ctx context.Context) (*Conn, error) {
+	select {
+	case conn := <-l.ready:
+		return conn, nil
+	case <-l.closed:
+		return nil, net.ErrClosed
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 
