@@ -732,7 +732,13 @@ func runInstall(args []string, defaultPath string) error {
 	if err != nil {
 		return err
 	}
-	st, err := mgr.Install(service.Config{ConfigPath: *configPath, StatePath: *statePath})
+	st, err := mgr.Install(service.Config{
+		ConfigPath: *configPath,
+		StatePath:  *statePath,
+		// Printed before the thing it describes happens, so an elevation
+		// prompt appearing out of nowhere has an explanation next to it.
+		Notify: func(msg string) { fmt.Println(msg) },
+	})
 	if err != nil {
 		return err
 	}

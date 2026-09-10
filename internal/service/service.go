@@ -34,6 +34,25 @@ type Config struct {
 	StatePath string
 	// LogDir receives stdout and stderr. Empty selects a platform default.
 	LogDir string
+	// Notify receives progress a person should see before it happens, such as
+	// a warning that an elevation prompt is about to appear. Zero discards it.
+	//
+	// A callback rather than printing from here, because a package that
+	// installs services has no business deciding where output goes -- and the
+	// one message that matters must arrive *before* the prompt does, so it
+	// cannot be part of the returned error.
+	Notify func(string)
+}
+
+// notify reports progress, if anyone is listening.
+//
+// A plain string rather than a format: every message here is assembled from
+// paths and usernames, so a format-style signature would only invite the
+// non-constant-format-string mistake without ever saving a Sprintf.
+func (c Config) notify(msg string) {
+	if c.Notify != nil {
+		c.Notify(msg)
+	}
 }
 
 // Status is what the platform reports about the service.

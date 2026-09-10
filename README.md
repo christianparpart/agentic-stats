@@ -69,10 +69,21 @@ make build
 ./bin/agentic-stats uninstall     # remove; the archive is untouched
 ```
 
-`install` registers a **user** service on all three platforms -- the daemon reads one
-person's home directory, so it never needs root or an administrator. On Linux it also
-attempts `loginctl enable-linger`, without which a user service stops the moment you log
-out, which is exactly wrong on a headless VM.
+`install` registers a **user** service on all three platforms: the daemon reads one
+person's home directory, so what runs is never root or an administrator.
+
+Installing it is free of that on Linux and macOS — a systemd `--user` unit and a launchd
+user agent both go in your own home directory. Windows is the exception: registering a
+logon task writes to the root Task Scheduler folder, which is administrator-only. That is
+a property of the folder, not of the daemon, and the task is still created with a limited
+run level. `install` notices, explains itself, and asks Windows for consent once, so you
+do not have to open a second elevated prompt and retype the command. Decline the prompt
+and nothing is installed.
+
+On Linux `install` also attempts `loginctl enable-linger`, without which a user service
+stops the moment you log out — exactly wrong on a headless VM. If that fails it says so,
+along with the command to fix it, rather than leaving you with a collector that only runs
+while you are connected.
 
 Nodes on the same network find each other automatically. For machines separated by a
 WireGuard or Tailscale tunnel, list them under `mesh.peers` -- multicast cannot cross a

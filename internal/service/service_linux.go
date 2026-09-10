@@ -47,7 +47,16 @@ func (s systemd) Install(cfg Config) (Status, error) {
 	// the case where an always-on collector matters most. Best effort: it
 	// needs privileges the user may not have, and the service still works
 	// while they are logged in.
-	_ = run("loginctl", "enable-linger")
+	//
+	// Saying so matters. Silently swallowing this leaves someone believing
+	// they have an always-on collector on the machine least likely to have a
+	// session open, and they would only find out from a gap in the archive.
+	if err := run("loginctl", "enable-linger"); err != nil {
+		cfg.notify("Could not enable lingering, so this service will stop when " +
+			"you log out and start again when you log back in. On a machine you " +
+			"reach over SSH that means it only collects while you are connected. " +
+			"To make it always-on: sudo loginctl enable-linger " + os.Getenv("USER"))
+	}
 
 	return s.Status()
 }

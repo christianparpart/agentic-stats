@@ -68,7 +68,12 @@ func (l launchd) Install(cfg Config) (Status, error) {
 	}
 	if err := run("launchctl", "kickstart", "-k", domainTarget()); err != nil {
 		// RunAtLoad still starts it at the next login even if starting it
-		// right now failed.
+		// right now failed. Worth saying, though: the difference between
+		// "installed and collecting" and "installed, collecting after you next
+		// log in" is a gap in the archive that nothing else would explain.
+		cfg.notify("Installed, but it could not be started right now. " +
+			"It will start when you next log in, or run: launchctl kickstart -k " +
+			domainTarget())
 		return l.Status()
 	}
 	return l.Status()

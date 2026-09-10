@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -32,12 +33,27 @@ func (s scheduler) Install(cfg Config) (Status, error) {
 	}
 
 	// /F replaces an existing task, so install is repeatable.
-	if err := run("schtasks", "/Create", "/F",
+	err = run("schtasks", "/Create", "/F",
 		"/SC", "ONLOGON",
 		"/TN", taskName,
 		"/TR", command,
-		"/RL", "LIMITED"); err != nil {
+		"/RL", "LIMITED")
+	switch {
+	case err == nil:
+	case isElevated():
+		// Already administrator, so rights are not what is wrong.
 		return Status{}, fmt.Errorf("service: create scheduled task: %w", err)
+	default:
+		// Almost certainly the root folder's permissions. Retrying elevated
+		// costs one dialog; guessing from the error text would not survive a
+		// non-English Windows, and schtasks reports too many things as exit
+		// status 1 to discriminate on the code.
+		if eerr := elevateInstall(cfg); eerr != nil {
+			return Status{}, errors.Join(
+				fmt.Errorf("service: create scheduled task: %w", err), eerr)
+		}
+		// The elevated child ran the whole install, including starting it.
+		return s.Status()
 	}
 	if err := run("schtasks", "/Run", "/TN", taskName); err != nil {
 		// The task exists and will start at the next logon even if starting
