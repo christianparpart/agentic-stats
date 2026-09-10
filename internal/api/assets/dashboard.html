@@ -15,9 +15,19 @@
     --grid: #e1e0d9;
     --axis: #c3c2b7;
     --border: rgba(11, 11, 11, 0.10);
+    /* Categorical slots. The first three are the original palette; 4 to 6
+       extend it along Okabe-Ito, whose blue, vermillion and bluish-green the
+       first three already approximate, darkened where the published value is
+       too light to sit on this background. --series-other is deliberately
+       chromaless: "everything else" is not a category and must not look like
+       one. */
     --series-1: #2a78d6;
     --series-2: #eb6834;
     --series-3: #1baf7a;
+    --series-4: #a8559b;
+    --series-5: #1f7f96;
+    --series-6: #96700d;
+    --series-other: #a3a199;
     --good: #0ca30c;
     --critical: #d03b3b;
   }
@@ -35,6 +45,10 @@
       --series-1: #3987e5;
       --series-2: #d95926;
       --series-3: #199e70;
+      --series-4: #c47ab8;
+      --series-5: #4fa8bf;
+      --series-6: #c9971f;
+      --series-other: #6f6d67;
     }
   }
   :root[data-theme="dark"] {
@@ -50,6 +64,10 @@
     --series-1: #3987e5;
     --series-2: #d95926;
     --series-3: #199e70;
+    --series-4: #c47ab8;
+    --series-5: #4fa8bf;
+    --series-6: #c9971f;
+    --series-other: #6f6d67;
   }
 
   * { box-sizing: border-box; }
@@ -101,6 +119,31 @@
   .card h2 { font-size: 15px; font-weight: 600; margin: 0 0 2px; }
   .card .cap { font-size: 12px; color: var(--text-secondary); margin: 0 0 16px; }
 
+  /* A card that carries a control puts it on the title's line, the same shape
+     as the page header. */
+  .card-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .card-head h2 { flex: 1; }
+  /* The base `label` rule below is the login form's; a control on a card
+     header is inline and carries no margin of its own. */
+  .control-label {
+    display: inline; margin: 0; font-size: 12px; color: var(--text-secondary);
+  }
+  select {
+    font: inherit; font-size: 13px; cursor: pointer; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--surface-1);
+    color: var(--text-primary); padding: 5px 8px;
+  }
+  select:hover { background: var(--plane); }
+
+  /* A stacked bar cannot carry the direct labels the horizontal charts use,
+     so the legend is where identity lives -- never the colour alone. */
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 4px 18px;
+    font-size: 12px; color: var(--text-secondary); margin: 10px 0 2px;
+  }
+  .legend span { white-space: nowrap; }
+  .legend .amount { color: var(--muted); margin-left: 6px; font-variant-numeric: tabular-nums; }
+
   svg { display: block; width: 100%; overflow: visible; }
   .grid-line { stroke: var(--grid); stroke-width: 1; }
   .axis-line { stroke: var(--axis); stroke-width: 1; }
@@ -133,6 +176,8 @@
   }
   #tip .t-val { font-variant-numeric: tabular-nums; font-weight: 600; }
   #tip .t-sub { color: var(--text-secondary); }
+  #tip .t-row { display: flex; align-items: baseline; gap: 10px; margin-top: 3px; }
+  #tip .t-row .t-amt { margin-left: auto; font-variant-numeric: tabular-nums; }
 
   /* --- login --- */
   .login { max-width: 340px; margin: 12vh auto; }
@@ -207,11 +252,18 @@
   <div class="tiles" id="tiles"></div>
 
   <section class="card">
-    <h2>Cost per day</h2>
+    <!-- The selector lives outside #daily, which the chart clears on every
+         render. -->
+    <div class="card-head">
+      <h2>Cost per day</h2>
+      <label class="control-label" for="stack-by">Stack by</label>
+      <select id="stack-by"></select>
+    </div>
     <p class="cap" id="daily-cap">API-equivalent cost, priced from folded token counts.
       One bar per <em>active</em> day &mdash; idle days are omitted, so the spacing is not a
       continuous timeline.</p>
     <div id="daily"></div>
+    <div class="legend" id="daily-legend"></div>
   </section>
 
   <section class="card" id="delivery-card">
@@ -241,12 +293,21 @@
 </main>
 
 <script>
-const SERIES = ["--series-1", "--series-2", "--series-3"];
+const SERIES = ["--series-1", "--series-2", "--series-3",
+                "--series-4", "--series-5", "--series-6"];
+// "Everything else" is not a category and does not take a categorical colour.
+const OTHER_COLOR = "--series-other";
 const tip = document.getElementById("tip");
 
 const fmtUSD = n => "$" + n.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
 const fmtInt = n => n.toLocaleString();
 const fmtCompact = n => n.toLocaleString(undefined, {notation: "compact", maximumFractionDigits: 1});
+
+// Escape anything that came out of the archive before it goes into innerHTML.
+// A segment label can be a repository name, a session id or a peer's
+// reverse-DNS name -- none of them chosen by this page.
+const esc = s => String(s).replace(/[&<>"']/g,
+  c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"})[c]);
 
 function showTip(evt, html) {
   tip.innerHTML = html;
@@ -267,17 +328,38 @@ function el(tag, attrs = {}, text) {
   return n;
 }
 
-/* Vertical bars: one series, so no legend — the title names it. */
-function dailyChart(host, days) {
+/* A rectangle with only its far end rounded, which is what every bar here is.
+   Vertical bars round the top, horizontal ones the right; a stack rounds only
+   its topmost slice, so the segments below it meet flush. */
+function barTop(x, y, w, h, r) {
+  r = Math.min(r, w / 2, h);
+  return `M${x},${y + h} L${x},${y + r} Q${x},${y} ${x + r},${y} ` +
+         `L${x + w - r},${y} Q${x + w},${y} ${x + w},${y + r} L${x + w},${y + h} Z`;
+}
+
+// colorOf gives a segment its slot. Order comes from the legend, which is
+// ranked over the whole range, so a colour means the same thing on every bar.
+function colorOf(segments, key) {
+  if (key === "__other__") return `var(${OTHER_COLOR})`;
+  const i = segments.findIndex(s => s.key === key);
+  return `var(${i < 0 ? OTHER_COLOR : SERIES[i % SERIES.length]})`;
+}
+
+/* Vertical bars, stacked by whichever dimension is selected. A stack has no
+   room for the direct labels the horizontal charts carry, so identity comes
+   from the legend below and the tooltip. */
+function dailyChart(host, days, legend) {
   host.innerHTML = "";
   if (!days.length) { host.innerHTML = '<p class="empty">No activity recorded yet.</p>'; return; }
 
+  const segments = (legend && legend.segments) || [];
   const W = host.clientWidth || 900, H = 260;
   const m = {t: 12, r: 8, b: 34, l: 56};
   const iw = W - m.l - m.r, ih = H - m.t - m.b;
   const max = Math.max(...days.map(d => d.cost_usd)) || 1;
+  const label = legend ? ` stacked by ${legend.label.toLowerCase()}` : "";
   const svg = el("svg", {viewBox: `0 0 ${W} ${H}`, role: "img",
-    "aria-label": `Cost per active day across ${days.length} days with recorded activity`});
+    "aria-label": `Cost per active day across ${days.length} days with recorded activity${label}`});
 
   // Recessive gridlines with axis labels.
   for (let i = 0; i <= 4; i++) {
@@ -290,19 +372,41 @@ function dailyChart(host, days) {
   // 2px gap between adjacent bars; 4px rounded top anchored to the baseline.
   const step = iw / days.length, bw = Math.max(3, Math.min(38, step - 2));
   days.forEach((d, i) => {
+    // The 1px floor keeps a tiny day visible, and belongs to the whole bar:
+    // applied per segment it would inflate the total it is meant to show.
     const h = Math.max(1, (d.cost_usd / max) * ih);
     const x = m.l + i * step + (step - bw) / 2, y = m.t + ih - h;
-    const r = Math.min(4, bw / 2, h);
-    svg.appendChild(el("path", {
-      d: `M${x},${y + h} L${x},${y + r} Q${x},${y} ${x + r},${y} L${x + bw - r},${y} Q${x + bw},${y} ${x + bw},${y + r} L${x + bw},${y + h} Z`,
-      fill: `var(${SERIES[0]})`
-    }));
+    const shares = (legend && d.stacks && d.stacks[legend.stack]) || [];
 
-    // Hit target larger than the mark.
+    if (!shares.length) {
+      // No breakdown: an older node in the mesh, or a day whose cost is
+      // entirely unpriced. One bar is still the truth about the total.
+      svg.appendChild(el("path", {d: barTop(x, y, bw, h, 4), fill: `var(${SERIES[0]})`}));
+    } else {
+      // Boundaries from a running total rather than per-segment heights, so
+      // rounding cannot leave a gap or overshoot the bar.
+      const total = shares.reduce((a, s) => a + s.cost_usd, 0) || 1;
+      let done = 0;
+      shares.forEach((s, k) => {
+        const top = y + h - ((done + s.cost_usd) / total) * h;
+        const bottom = y + h - (done / total) * h;
+        done += s.cost_usd;
+        const sh = bottom - top;
+        if (sh <= 0) return;
+        svg.appendChild(el("path", {
+          // Only the topmost slice is rounded; the rest meet flush.
+          d: k === shares.length - 1 ? barTop(x, top, bw, sh, 4)
+                                     : `M${x},${top} h${bw} v${sh} h${-bw} Z`,
+          fill: colorOf(segments, s.key)
+        }));
+      });
+    }
+
+    // Hit target larger than the mark, and one per day rather than per
+    // segment: a segment worth a fraction of a cent is a sliver nobody can
+    // point at, so the tooltip lists the whole stack instead.
     const hit = el("rect", {x: m.l + i * step, y: m.t, width: step, height: ih, class: "hit"});
-    hit.addEventListener("mousemove", e => showTip(e,
-      `<div class="t-val">${fmtUSD(d.cost_usd)}</div>` +
-      `<div class="t-sub">${d.date} · ${fmtInt(d.requests)} requests · ${fmtInt(d.output_tokens)} output tokens</div>`));
+    hit.addEventListener("mousemove", e => showTip(e, dayTip(d, shares, segments)));
     hit.addEventListener("mouseleave", hideTip);
     svg.appendChild(hit);
 
@@ -315,6 +419,32 @@ function dailyChart(host, days) {
 
   svg.appendChild(el("line", {x1: m.l, y1: m.t + ih, x2: m.l + iw, y2: m.t + ih, class: "axis-line"}));
   host.appendChild(svg);
+}
+
+// dayTip is the day's total, then its stack biggest-first.
+function dayTip(d, shares, segments) {
+  let html = `<div class="t-val">${fmtUSD(d.cost_usd)}</div>` +
+    `<div class="t-sub">${esc(d.date)} · ${fmtInt(d.requests)} requests · ` +
+    `${fmtInt(d.output_tokens)} output tokens</div>`;
+  for (const s of shares.slice().sort((a, b) => b.cost_usd - a.cost_usd)) {
+    html += `<div class="t-row"><span class="swatch" style="background:${colorOf(segments, s.key)}"></span>` +
+      `${esc(nameOf(segments, s.key))}<span class="t-amt">${fmtUSD(s.cost_usd)}</span></div>`;
+  }
+  return html;
+}
+
+function nameOf(segments, key) {
+  const s = segments.find(x => x.key === key);
+  return s ? s.label : key;
+}
+
+// dailyLegend names every segment, because a stack cannot be labelled in place
+// and colour alone is never an identity here.
+function dailyLegend(host, legend) {
+  if (!legend || !legend.segments.length) { host.innerHTML = ""; return; }
+  host.innerHTML = legend.segments.map(s =>
+    `<span><span class="swatch" style="background:${colorOf(legend.segments, s.key)}"></span>` +
+    `${esc(s.label)}<span class="amount">${fmtUSD(s.total_usd)}</span></span>`).join("");
 }
 
 /* Horizontal bars, directly labelled — required relief for the light-mode
@@ -460,6 +590,11 @@ function showLogin() { showOnly("login"); }
 let lastData = {summary: null, daily: null, delivery: null};
 let failed = {};
 
+// Which dimension the daily bars are stacked by. Its own variable rather than
+// part of lastData, which load() resets. Not persisted, matching the theme
+// toggle -- one reload behaviour for the whole page rather than two.
+let stackBy = "model";
+
 /* Three requests, drawn as each one lands.
    The reports do not cost the same to answer and the archive only grows, so
    waiting for all three before drawing any let the slowest decide when the
@@ -526,11 +661,52 @@ function render() {
     scope.textContent = "";
   }
 
-  if (daily) dailyChart(document.getElementById("daily"), daily.days || []);
+  if (daily) dailyView(daily);
   else pending(document.getElementById("daily"), failed.daily, "the daily breakdown");
 
   if (delivery) deliveryView(delivery);
   else pending(document.getElementById("delivery"), failed.delivery, "pull requests");
+}
+
+/* The daily card: selector, chart, legend and caption, which have to agree
+   with each other and are therefore drawn together. */
+function dailyView(daily) {
+  const legends = daily.legends || [];
+  const picker = document.getElementById("stack-by");
+  const chosen = legends.find(l => l.stack === stackBy) || legends[0];
+
+  // An older node in the mesh sends days and no legends; every node serves its
+  // own dashboard and they are not upgraded together. Hide the control rather
+  // than offer a choice that does nothing.
+  //
+  // The class, not the hidden attribute: .control-label sets an explicit
+  // display, and an author rule beats the browser's own [hidden] rule.
+  const none = legends.length === 0;
+  picker.classList.toggle("hidden", none);
+  document.querySelector(".control-label").classList.toggle("hidden", none);
+  if (legends.length) {
+    const wanted = legends.map(l => l.stack).join(" ");
+    if (picker.dataset.built !== wanted) {
+      picker.innerHTML = legends.map(l =>
+        `<option value="${esc(l.stack)}">${esc(l.label)}</option>`).join("");
+      picker.dataset.built = wanted;
+    }
+    picker.value = chosen.stack;
+  }
+
+  dailyChart(document.getElementById("daily"), daily.days || [], chosen);
+  dailyLegend(document.getElementById("daily-legend"), chosen);
+
+  let cap = "API-equivalent cost, priced from folded token counts. One bar per " +
+    "<em>active</em> day &mdash; idle days are omitted, so the spacing is not a " +
+    "continuous timeline.";
+  if (chosen) {
+    cap += ` Stacked by ${esc(chosen.label.toLowerCase())}`;
+    const other = chosen.segments.find(s => s.key === "__other__");
+    cap += other ? `, the six most expensive named and the rest gathered into Other.` : ".";
+    if (chosen.note) cap += " " + esc(chosen.note);
+  }
+  document.getElementById("daily-cap").innerHTML = cap;
 }
 
 // pending fills a panel that has nothing to draw yet, so a slow or broken
@@ -580,6 +756,12 @@ document.getElementById("login-form").addEventListener("submit", async e => {
     btn.disabled = false;
     btn.textContent = "Sign in";
   }
+});
+
+document.getElementById("stack-by").addEventListener("change", e => {
+  // Every dimension came down with the data, so this is a redraw, not a fetch.
+  stackBy = e.currentTarget.value;
+  render();
 });
 
 document.getElementById("retry").addEventListener("click", () => {

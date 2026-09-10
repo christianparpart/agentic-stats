@@ -288,12 +288,15 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDaily(w http.ResponseWriter, r *http.Request) {
-	days, err := s.derive.Daily(r.Context())
+	activity, err := s.derive.Daily(r.Context())
 	if err != nil {
 		s.queryFailed(w, r, "daily", "daily failed", err)
 		return
 	}
-	s.respond(w, http.StatusOK, map[string]any{"days": days})
+	// Activity carries the same "days" key it always did, plus the legends
+	// that read its stacks. A dashboard served by an older node in the mesh
+	// sees the days and ignores the rest.
+	s.respond(w, http.StatusOK, activity)
 }
 
 func (s *Server) handleDelivery(w http.ResponseWriter, r *http.Request) {

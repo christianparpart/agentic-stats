@@ -28,6 +28,7 @@ func TestTheDashboardQueriesAreAnsweredFromIndexesAlone(t *testing.T) {
 	queries := []struct{ name, sql string }{
 		{"model usage", modelUsageQuery},
 		{"daily usage", dailyUsageQuery},
+		{"session links", sessionLinksQuery},
 		{"deliveries", deliveriesQuery},
 		{"attribution", attributionQuery},
 	}

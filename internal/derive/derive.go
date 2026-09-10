@@ -71,12 +71,99 @@ type Summary struct {
 	UnpricedModels []string `json:"unpriced_models,omitempty"`
 }
 
+// Stack is a way of dividing a day's cost.
+//
+// A named type rather than a bare string so a caller cannot ask for "sessions"
+// and silently receive nothing. The wire form is the string, which is what the
+// dashboard keys its selector on.
+type Stack string
+
+const (
+	// StackModel divides by the model that answered.
+	StackModel Stack = "model"
+	// StackProject divides by the repository the session's pull requests went
+	// to, which is the only project identity the archive actually holds.
+	StackProject Stack = "project"
+	// StackPullRequest divides by the pull request the session opened.
+	StackPullRequest Stack = "pull_request"
+	// StackSession divides by the assistant session.
+	StackSession Stack = "session"
+	// StackPeer divides by the machine that collected the work.
+	StackPeer Stack = "peer"
+)
+
+// MaxSegments is how many named slices a stack shows before the rest is folded
+// into one.
+//
+// Six because that is how many categorical colours the dashboard has that are
+// distinguishable from each other, and a stacked bar has no room for the
+// direct labels the horizontal charts use -- past the palette, a seventh
+// colour is not another category, it is a lie.
+const MaxSegments = 6
+
+// OtherKey and NoneKey are the two segments that are not a real category.
+//
+// Spelled so they cannot collide with a model name, a repository or a session
+// id, because a collision would silently merge a real category into a
+// catch-all and the total would still add up.
+const (
+	OtherKey = "__other__"
+	NoneKey  = "__none__"
+)
+
+// Share is one segment's part of one day's cost.
+//
+// Only the key: the label lives once in the Legend rather than being repeated
+// for every day it appears on.
+type Share struct {
+	Key     string  `json:"key"`
+	CostUSD float64 `json:"cost_usd"`
+}
+
+// Segment names one slice of a stacked bar.
+type Segment struct {
+	Key   string `json:"key"`
+	Label string `json:"label"`
+	// TotalUSD is this segment's cost across every day reported, which is what
+	// the segments were ranked by.
+	//
+	// Ranked over the whole range rather than per day on purpose: a colour has
+	// to mean the same thing on every bar, and a per-day ranking would make
+	// slot three a different session each time it appeared.
+	TotalUSD float64 `json:"total_usd"`
+}
+
+// Legend is one stacking dimension and the segments it divides into, in the
+// order they stack.
+type Legend struct {
+	Stack Stack  `json:"stack"`
+	Label string `json:"label"`
+	// Note explains an allocation where the division is not a measurement.
+	Note     string    `json:"note,omitempty"`
+	Segments []Segment `json:"segments"`
+}
+
 // Day is one day's activity, in UTC.
 type Day struct {
 	Date         string  `json:"date"`
 	Requests     int64   `json:"requests"`
 	OutputTokens int64   `json:"output_tokens"`
 	CostUSD      float64 `json:"cost_usd"`
+
+	// Stacks divides CostUSD by each dimension, in legend order.
+	//
+	// Every dimension's shares sum to CostUSD. That is the property the chart
+	// rests on and the one the tests check hardest: splitting a session's cost
+	// between the pull requests it opened must redistribute it, never create
+	// or destroy it.
+	Stacks map[Stack][]Share `json:"stacks,omitempty"`
+}
+
+// Activity is the daily report: one entry per active day, and the legends
+// needed to read the stacks.
+type Activity struct {
+	Days    []Day    `json:"days"`
+	Legends []Legend `json:"legends"`
 }
 
 // Service derives facts from the archive.
@@ -116,6 +203,11 @@ const foldedUsageCTE = `
 WITH folded AS (
     SELECT model,
            session_id,
+           -- The machine that collected this request. A bare column beside the
+           -- min(), so it comes from the same picked row: a request collected
+           -- on two machines is billed to one of them, deterministically,
+           -- rather than to both.
+           origin_id,
            substr(coalesce(captured_at, ''), 1, 10) AS day,
            input_tokens, output_tokens, think_tokens,
            cache_read, cache_write5m, cache_write1h,
@@ -146,15 +238,36 @@ SELECT coalesce(model, 'unknown'),
  GROUP BY model
  ORDER BY sum(output_tokens) DESC`
 
-// dailyUsageQuery totals the fold per day and model, oldest first.
+// dailyUsageQuery totals the fold per day and per stackable dimension.
+//
+// One grid rather than one query per dimension. Model has to stay in the
+// grouping whatever else is asked for, because cost is a per-model function of
+// five token counts applied in Go, so every other dimension has to be totalled
+// alongside it and folded afterwards. Once model is there, adding the origin
+// and the session costs nothing but rows -- both are columns of `records_fold`
+// already -- and one query then answers every dimension the dashboard offers.
+//
+// Around 1,200 rows on a 480k-record archive: a day has a handful of sessions,
+// each using a couple of models, on one machine.
 const dailyUsageQuery = foldedUsageCTE + `
-SELECT day, coalesce(model, 'unknown'), count(*), sum(output_tokens),
+SELECT day, coalesce(model, 'unknown'), origin_id, coalesce(session_id, ''),
+       count(*), sum(output_tokens),
        sum(input_tokens), sum(cache_read),
        sum(cache_write5m), sum(cache_write1h)
   FROM folded
  WHERE day <> ''
- GROUP BY day, model
+ GROUP BY day, model, origin_id, session_id
  ORDER BY day`
+
+// sessionLinksQuery names the pull requests each session opened.
+//
+// Covered by records_pr_session, and small -- a few hundred rows. It carries
+// two dimensions at once: the pull request itself, and the project, which is
+// the repository the pull request went to.
+const sessionLinksQuery = `
+SELECT DISTINCT session_id, pr_repo, pr_number
+  FROM records
+ WHERE pr_repo IS NOT NULL AND session_id IS NOT NULL`
 
 // deliveriesQuery splits each session's usage between the pull requests it
 // produced, one row per (pull request, model).
@@ -253,51 +366,6 @@ func (s *Service) Summarize(ctx context.Context) (Summary, error) {
 
 	s.price(&sum)
 	return sum, nil
-}
-
-// Daily returns per-day activity, oldest first.
-func (s *Service) Daily(ctx context.Context) ([]Day, error) {
-	rows, err := s.db.SQL().QueryContext(ctx, dailyUsageQuery)
-	if err != nil {
-		return nil, fmt.Errorf("derive: daily: %w", err)
-	}
-	defer func() { _ = rows.Close() }() // rows fully drained below
-
-	byDay := make(map[string]*Day)
-	var order []string
-	for rows.Next() {
-		var (
-			day, model string
-			u          pricing.Usage
-			requests   int64
-			output     int64
-		)
-		if err := rows.Scan(&day, &model, &requests, &output,
-			&u.Input, &u.CacheRead, &u.CacheWrite5m, &u.CacheWrite1h); err != nil {
-			return nil, fmt.Errorf("derive: scan daily row: %w", err)
-		}
-		u.Output = output
-		d, ok := byDay[day]
-		if !ok {
-			d = &Day{Date: day}
-			byDay[day] = d
-			order = append(order, day)
-		}
-		d.Requests += requests
-		d.OutputTokens += output
-		if cost, priced := s.prices.Cost(model, u); priced {
-			d.CostUSD += cost
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("derive: daily: %w", err)
-	}
-
-	days := make([]Day, 0, len(order))
-	for _, day := range order {
-		days = append(days, *byDay[day])
-	}
-	return days, nil
 }
 
 // PullRequest is what one shipped pull request cost.

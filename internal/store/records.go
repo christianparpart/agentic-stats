@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"net"
 	"strings"
 	"time"
 )
@@ -536,6 +537,42 @@ func (db *DB) SaveHostname(ctx context.Context, ip, name string) error {
 		return fmt.Errorf("store: save hostname: %w", err)
 	}
 	return nil
+}
+
+// PeerNames maps each known peer to the friendliest name this node has for it.
+//
+// A peer id is an origin id -- the mesh mints one from the other -- so this is
+// also how a record's origin becomes something a person can read. Only peers
+// with a resolved reverse-DNS name appear; a peer whose addresses have none is
+// absent rather than present under a placeholder, so the caller decides what
+// to show instead of unpicking one here.
+//
+// This node is not in the result. It has no peers row, by design: the mesh
+// excludes itself from its own peer list.
+func (db *DB) PeerNames(ctx context.Context) (map[string]string, error) {
+	peers, err := db.Peers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	hosts, err := db.Hostnames(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(map[string]string, len(peers))
+	for _, p := range peers {
+		for _, addr := range p.Addrs {
+			host := addr
+			if h, _, err := net.SplitHostPort(addr); err == nil {
+				host = h
+			}
+			if name := hosts[host].Name; name != "" {
+				out[p.ID] = name
+				break
+			}
+		}
+	}
+	return out, nil
 }
 
 // Peers returns every peer this node knows about.

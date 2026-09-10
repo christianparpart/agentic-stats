@@ -158,12 +158,12 @@ func TestDeriveFoldsRepeatedUsageByRequestID(t *testing.T) {
 		t.Errorf("cache savings = %v, want positive", sum.CacheSavingsUSD)
 	}
 
-	days, err := n.derive.Daily(ctx)
+	activity, err := n.derive.Daily(ctx)
 	if err != nil {
 		t.Fatalf("Daily: %v", err)
 	}
-	if len(days) != 1 || days[0].Requests != 2 {
-		t.Errorf("daily = %+v, want one day with 2 requests", days)
+	if len(activity.Days) != 1 || activity.Days[0].Requests != 2 {
+		t.Errorf("daily = %+v, want one day with 2 requests", activity.Days)
 	}
 }
 
