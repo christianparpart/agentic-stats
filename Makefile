@@ -1,5 +1,9 @@
 GO ?= go
-PLATFORMS := darwin/arm64 linux/amd64 linux/arm64 windows/amd64
+# Every machine a node may run on. Both architectures on all three systems:
+# a node that cannot be built for a platform cannot be upgraded on it either,
+# and an Intel Mac or a Windows-on-ARM box would otherwise be stranded on
+# whatever build it was first given.
+PLATFORMS := darwin/amd64 darwin/arm64 linux/amd64 linux/arm64 windows/amd64 windows/arm64
 
 # Windows needs two builds of the same source. A console program registered as
 # a logon task shows a window at every login; a GUI-subsystem one does not, but
@@ -20,15 +24,13 @@ GOOS_NOW := $(shell $(GO) env GOOS)
 # it follows), and it needs a .git directory at build time, which a release
 # cross-compiled from a tarball does not have.
 #
-# Computed without a shell redirect or `||`, because `make build` otherwise
-# stops working wherever cmd.exe is the shell -- which is every Windows machine
-# that has make but no POSIX sh, and this project ships on Windows. The empty
-# check is make's own, so it needs no shell at all.
-# $(or ...) is a make builtin, not a shell operator, so this keeps working
-# where cmd.exe is the shell. Both it and VERSION_LDFLAGS are deferred rather
-# than expanded at parse time: `git describe` costs ~50ms on Windows, and a
-# simply-expanded assignment would charge it to `make test`, `make lint` and
-# `make clean`, none of which stamp anything.
+# Computed with make's own $(or ...) rather than a shell redirect or `||`,
+# because `make build` otherwise stops working wherever cmd.exe is the shell --
+# every Windows machine with make but no POSIX sh, and this project ships on
+# Windows. Both this and VERSION_LDFLAGS are deferred rather than expanded at
+# parse time: `git describe` costs ~50ms here, and a simply-expanded assignment
+# would charge it to `make test`, `make lint` and `make clean`, none of which
+# stamp anything.
 VERSION ?= $(or $(shell git describe --tags --always --dirty),dev)
 VERSION_LDFLAGS = -X main.buildVersion=$(VERSION)
 
@@ -39,7 +41,7 @@ ifeq ($(GOOS_NOW),windows)
 EXE := .exe
 endif
 
-.PHONY: check fmt vet lint test build release version ldflags clean
+.PHONY: check fmt vet lint test build release release-binaries version ldflags clean
 
 check: fmt vet lint test
 
@@ -78,8 +80,19 @@ version:
 ldflags:
 	@echo $(VERSION_LDFLAGS)
 
-## release: static binaries for every supported machine in the fleet
-release:
+## release: static binaries for every supported machine in the fleet,
+## with the checksum manifest a node verifies one signature over
+##
+## One phony target rather than a file target: the recipe deletes dist first,
+## so there is never an up-to-date SHA256SUMS for make to compare against, and
+## a file target would only imply otherwise.
+release: release-binaries
+	@$(GO) run ./internal/release/cmd/relsign manifest dist $(VERSION) dist/SHA256SUMS
+
+## release-binaries: the cross-compiled binaries alone, without a manifest.
+## What CI builds to prove every platform still compiles.
+release-binaries:
+	@rm -rf dist
 	@mkdir -p dist
 	@for p in $(PLATFORMS); do \
 		os=$${p%/*}; arch=$${p#*/}; ext=""; \

@@ -5,6 +5,9 @@ on:
     branches: [master]
   pull_request:
   workflow_dispatch:
+  # Callable so the release workflow gates on this exact suite rather than a
+  # second, weaker definition of "the tests pass".
+  workflow_call:
 
 permissions:
   contents: read
@@ -95,41 +98,27 @@ jobs:
           fi
 
   build:
-    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    name: Cross-compile every platform
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { goos: darwin,  goarch: arm64 }
-          - { goos: linux,   goarch: amd64 }
-          - { goos: linux,   goarch: arm64 }
-          - { goos: windows, goarch: amd64 }
     steps:
-      # Shallow, deliberately. This job compiles to /tmp and throws the result
-      # away, so the version it stamps is never read -- the link flags are
-      # exercised whatever the string says. Full history belongs in the job
-      # that publishes an artifact somebody installs.
+      # Shallow, deliberately. These binaries are thrown away; the version
+      # they carry is never read, and the link flags are exercised whatever
+      # the string says. Full history belongs in the job that publishes.
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
 
-      # The collector must be a dependency-free static binary: it gets dropped
-      # onto machines that have no toolchain.
+      # `make release-binaries`, not a matrix of hand-written `go build` lines.
+      # The platform list and the link flags then live once, in the Makefile,
+      # and what CI proves compilable is exactly what a release ships --
+      # including the Windows GUI twins, which the old matrix never built.
+      # Cross-compiling six targets with a warm module cache is seconds, so
+      # the lost fan-out costs nothing; the loop names each platform as it
+      # goes, so a failure is still attributed.
       - name: Build
-        env:
-          CGO_ENABLED: "0"
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-        # Assigned on its own line first: a command substitution nested in a
-        # larger command does not trip `bash -e`, so a missing make or a
-        # renamed target would expand to nothing and silently produce the
-        # unstamped binary the ldflags target exists to prevent.
-        run: |
-          flags="$(make -s ldflags)"
-          go build -trimpath -ldflags "-s -w $flags" -o /tmp/ ./cmd/...
+        run: make release-binaries
 
   secrets:
     name: Secret scan
