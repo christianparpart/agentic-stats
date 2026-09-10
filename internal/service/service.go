@@ -129,6 +129,7 @@ func (c Config) resolve() (Config, error) {
 	if _, err := os.Stat(c.Executable); err != nil {
 		return Config{}, fmt.Errorf("service: %s is not runnable: %w", c.Executable, err)
 	}
+	c.Executable = serviceBinary(c.Executable, c.notify)
 	return c, nil
 }
 

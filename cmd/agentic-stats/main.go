@@ -649,6 +649,7 @@ func runStatus(args []string, defaultPath string) error {
 	}
 
 	fmt.Printf("origin   %s\n", n.db.OriginID())
+	fmt.Printf("service  %s\n", serviceSummary())
 	fmt.Printf("records  %d\n", count)
 	fmt.Printf("origins  %d\n", len(vec))
 	for origin, seq := range vec {
@@ -688,6 +689,30 @@ func runStatus(args []string, defaultPath string) error {
 		fmt.Println("cloned VM or a copied database. Their data is being kept, not merged.")
 	}
 	return nil
+}
+
+// serviceSummary describes the autostart entry in one line, for `status`.
+//
+// Never an error. `status` reports on the archive, and the archive is readable
+// whether or not a service is installed -- failing the whole command because
+// the platform's service manager could not be asked would be reporting the
+// wrong thing as broken.
+func serviceSummary() string {
+	mgr, err := service.New()
+	if err != nil {
+		return "unknown (" + err.Error() + ")"
+	}
+	st, err := mgr.Status()
+	switch {
+	case err != nil:
+		return "unknown (" + err.Error() + ")"
+	case !st.Installed:
+		return "not installed (run `agentic-stats install` to start it at login)"
+	case st.Running:
+		return "running"
+	default:
+		return "installed but stopped (run `agentic-stats start`)"
+	}
 }
 
 // runBridge publishes to and fetches from external storage on an interval.

@@ -107,10 +107,14 @@ errors go there.** Event Viewer is where someone looks to find out whether anyth
 wrong, and a "pass complete" every poll interval would bury the entries that matter; the
 full detail is in the file.
 
-The Windows binary is linked for the GUI subsystem so the service runs without a console
-window appearing at every login. The command line still prints normally — it reattaches to
-whatever console launched it — with one visible consequence: a shell does not wait for a
-GUI-subsystem program, so output can arrive just after your prompt returns.
+Windows ships **two binaries built from the same source**, for the same reason python and
+node do. Whether a program gets a console window is decided by its subsystem, not by how it
+is launched, so a console binary registered as a logon task shows a window every time you
+log in — and a GUI-subsystem one does not, but a shell will not wait for it, which makes it
+useless as a command line. `agentic-stats.exe` is the command line; `agentic-statsw.exe`
+beside it is what the service runs. `install` picks the second automatically, and falls
+back to the first with a warning if it is missing, since a service with a window beats an
+install that refuses.
 
 Nodes on the same network find each other automatically. For machines separated by a
 WireGuard or Tailscale tunnel, list them under `mesh.peers` -- multicast cannot cross a
