@@ -93,11 +93,14 @@ func TestProjectNamesAreIndependentOfPathSeparator(t *testing.T) {
 	}
 }
 
-// A project name may depend on the path and the pattern table, and on nothing
-// else. This forbids re-introducing a set of names learned from the archive,
-// which is the change most likely to be attempted here: it would make a node
-// that has received half the mesh disagree with one that has received all of it.
-func TestProjectFoldingDoesNotDependOnWhatElseTheArchiveHolds(t *testing.T) {
+// The single-path fold answers from the path and the pattern table alone.
+//
+// resolve deliberately does more -- containment cannot be decided one path at a
+// time -- but the *name* rules must never start inferring from similarity. A
+// rule that folded `fastcached-wt-139` because some other directory happened to
+// be called `fastcached` would be reading a coincidence rather than a fact
+// about a path, and it is the change most likely to be attempted here.
+func TestTheSinglePathFoldReadsOnlyThePath(t *testing.T) {
 	r := rules(t)
 	alone := r.of(`D:\fastcached-wt-139`, nil)
 	for _, other := range []string{`D:\fastcached`, `D:\fastcached-wt`, `D:\endo`, ""} {
@@ -301,6 +304,130 @@ func TestRepoNameDropsEveryQualifier(t *testing.T) {
 	} {
 		if got := repoName(tc.in); got != tc.want {
 			t.Errorf("repoName(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// resolveWith is resolve over a set of directories with no pull requests, so a
+// case exercises containment and the name rules alone.
+func resolveWith(t *testing.T, dirs ...string) map[string]string {
+	t.Helper()
+	return rules(t).resolve(dirs, nil)
+}
+
+// A working directory is not always a repository root. A build tree inside one
+// is not a project, and without containment it becomes a project named after
+// the build configuration -- `cl-release`, `win64-cl-ninja-release`, `WIX`.
+//
+// No list of directory names fixes this. `out`, `build` and `target` would miss
+// `src\apps\...`, and a list long enough to catch that would eventually swallow
+// a project genuinely called `src`. Being inside a project is the property that
+// matters.
+func TestADirectoryInsideAProjectBelongsToIt(t *testing.T) {
+	got := resolveWith(t,
+		`D:\Lastrada`,
+		`D:\Lastrada\out\build\win64-cl-ninja-release`,
+		`D:\fastcached`,
+		`D:\fastcached\out\build\cl-release`,
+		`D:\fastcached\src\apps\compile-cache-testclient`,
+		`D:\endo`,
+		`D:\endo\build\clangcl-release\_CPack_Packages\win64\WIX`,
+	)
+	for dir, want := range map[string]string{
+		`D:\Lastrada`: "Lastrada",
+		`D:\Lastrada\out\build\win64-cl-ninja-release`: "Lastrada",
+		`D:\fastcached`:                                   "fastcached",
+		`D:\fastcached\out\build\cl-release`:              "fastcached",
+		`D:\fastcached\src\apps\compile-cache-testclient`: "fastcached",
+		`D:\endo`: "endo",
+		`D:\endo\build\clangcl-release\_CPack_Packages\win64\WIX`: "endo",
+	} {
+		if got[dir] != want {
+			t.Errorf("%s -> %q, want %q", dir, got[dir], want)
+		}
+	}
+}
+
+// A filesystem root contains everything and is not a project. `D:\` is a real
+// working directory in a real archive, and folding onto it put every top-level
+// project into "no project" -- 883 records of one of them -- when containment
+// was first tried without this guard.
+func TestAFilesystemRootNeverClaimsWhatIsUnderIt(t *testing.T) {
+	got := resolveWith(t, `D:\`, `D:\Domestique`, `D:\tmp`, `/`, "/srv/thing")
+	for dir, want := range map[string]string{
+		`D:\`:           "",
+		`D:\Domestique`: "Domestique",
+		`D:\tmp`:        "tmp",
+		"/":             "",
+		"/srv/thing":    "thing",
+	} {
+		if got[dir] != want {
+			t.Errorf("%s -> %q, want %q", dir, got[dir], want)
+		}
+	}
+}
+
+// A repository nested inside another that ships on its own account is its own
+// project: the pull request is exact and containment must not overrule it.
+func TestANestedRepositoryThatShipsSeparatelyKeepsItsProject(t *testing.T) {
+	got := rules(t).resolve(
+		[]string{`D:\fastcached`, `D:\fastcached\vendor\morph`, `D:\fastcached\out\build\cl-debug`},
+		map[string][]string{
+			`D:\fastcached`:              {"LASTRADA-Software/fastcached"},
+			`D:\fastcached\vendor\morph`: {"LASTRADA-Software/morph"},
+		})
+	if p := got[`D:\fastcached\vendor\morph`]; p != "morph" {
+		t.Errorf("the nested repository resolved to %q, want morph", p)
+	}
+	// While a directory with no pull request of its own still folds inward.
+	if p := got[`D:\fastcached\out\build\cl-debug`]; p != "fastcached" {
+		t.Errorf("the build tree resolved to %q, want fastcached", p)
+	}
+}
+
+// Containment matches whole segments. A sibling whose name merely begins with
+// the project's is not inside it.
+func TestASiblingIsNotContainedByItsNeighbour(t *testing.T) {
+	got := resolveWith(t, `D:\fastcached`, `D:\fastcached-distributed-compilation`)
+	if p := got[`D:\fastcached-distributed-compilation`]; p != "fastcached-distributed-compilation" {
+		t.Errorf("the sibling resolved to %q by containment; only a pull request may fold it", p)
+	}
+}
+
+// The answer must not depend on the order the directories arrive in, or two
+// nodes holding the same records could label the same directory differently.
+func TestResolveDoesNotDependOnDirectoryOrder(t *testing.T) {
+	dirs := []string{
+		`D:\`, `D:\fastcached`, `D:\fastcached\out\build\cl-release`,
+		`D:\fastcached\out`, `D:\Lastrada\out\build\win64-cl-ninja-release`,
+		`D:\Lastrada`, `D:\tmp`, `D:\fastcached-issue-154`,
+	}
+	want := resolveWith(t, dirs...)
+	for shift := range dirs {
+		rotated := append(append([]string{}, dirs[shift:]...), dirs[:shift]...)
+		got := resolveWith(t, rotated...)
+		for _, d := range dirs {
+			if got[d] != want[d] {
+				t.Fatalf("rotating by %d changed %s from %q to %q",
+					shift, d, want[d], got[d])
+			}
+		}
+	}
+}
+
+// Containment resolves through an intermediate directory rather than stopping
+// at the first ancestor it finds, so a chain collapses to the project.
+func TestContainmentResolvesThroughAChain(t *testing.T) {
+	got := resolveWith(t,
+		`D:\fastcached`, `D:\fastcached\out`, `D:\fastcached\out\build`,
+		`D:\fastcached\out\build\cl-release\deep\deeper`)
+	for dir, want := range map[string]string{
+		`D:\fastcached\out`:                              "fastcached",
+		`D:\fastcached\out\build`:                        "fastcached",
+		`D:\fastcached\out\build\cl-release\deep\deeper`: "fastcached",
+	} {
+		if got[dir] != want {
+			t.Errorf("%s -> %q, want %q", dir, got[dir], want)
 		}
 	}
 }

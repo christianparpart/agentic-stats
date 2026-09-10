@@ -494,16 +494,22 @@ func sorted(m map[string]map[string]struct{}) map[string][]string {
 	return out
 }
 
-// projectsOf resolves each distinct working directory in the grid once.
+// projectsOf resolves the grid's distinct working directories.
+//
+// All of them together, not one at a time: a directory that sits inside another
+// belongs to the project that contains it, so the answer for one depends on
+// which others exist.
 func (s *Service) projectsOf(grid []gridRow, shipped map[string][]string) map[string]string {
-	out := make(map[string]string)
+	seen := make(map[string]struct{}, len(grid))
+	dirs := make([]string, 0, len(grid))
 	for _, r := range grid {
-		if _, done := out[r.cwd]; done {
+		if _, done := seen[r.cwd]; done {
 			continue
 		}
-		out[r.cwd] = s.projects.of(r.cwd, shipped[r.cwd])
+		seen[r.cwd] = struct{}{}
+		dirs = append(dirs, r.cwd)
 	}
-	return out
+	return s.projects.resolve(dirs, shipped)
 }
 
 // segmentNames gathers everything needed to label a segment.
