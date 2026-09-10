@@ -182,11 +182,32 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	s.respond(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// queryFailed reports a failed dashboard query, telling a genuine fault apart
+// from a caller that hung up.
+//
+// A caller that goes away cancels the request context, which interrupts the
+// statement in flight. The driver surfaces that as a bare INTERRUPT code: it
+// neither wraps nor unwraps to context.Canceled, so errors.Is against that
+// would never match and the error alone cannot be discriminated. The request
+// context is the witness instead.
+//
+// An abandoned request is not a fault. Nobody is left to read a status line,
+// and logging a closed tab at error level makes a healthy node look broken --
+// which teaches the reader to skip the log that is supposed to carry the real
+// failures.
+func (s *Server) queryFailed(w http.ResponseWriter, r *http.Request, op, msg string, err error) {
+	if r.Context().Err() != nil {
+		s.log.Debug("query abandoned by caller", "query", op, "error", err)
+		return
+	}
+	s.log.Error(op, "error", err)
+	s.fail(w, http.StatusInternalServerError, msg)
+}
+
 func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 	summary, err := s.derive.Summarize(r.Context())
 	if err != nil {
-		s.log.Error("summarize", "error", err)
-		s.fail(w, http.StatusInternalServerError, "summary failed")
+		s.queryFailed(w, r, "summarize", "summary failed", err)
 		return
 	}
 	s.respond(w, http.StatusOK, summary)
@@ -195,8 +216,7 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDaily(w http.ResponseWriter, r *http.Request) {
 	days, err := s.derive.Daily(r.Context())
 	if err != nil {
-		s.log.Error("daily", "error", err)
-		s.fail(w, http.StatusInternalServerError, "daily failed")
+		s.queryFailed(w, r, "daily", "daily failed", err)
 		return
 	}
 	s.respond(w, http.StatusOK, map[string]any{"days": days})
@@ -205,8 +225,7 @@ func (s *Server) handleDaily(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDelivery(w http.ResponseWriter, r *http.Request) {
 	delivery, err := s.derive.Deliveries(r.Context())
 	if err != nil {
-		s.log.Error("deliveries", "error", err)
-		s.fail(w, http.StatusInternalServerError, "delivery failed")
+		s.queryFailed(w, r, "deliveries", "delivery failed", err)
 		return
 	}
 	s.respond(w, http.StatusOK, delivery)

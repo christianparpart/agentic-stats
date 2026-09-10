@@ -145,6 +145,8 @@
   .err { color: var(--critical); font-size: 13px; margin-top: 12px; min-height: 18px; }
   .primary { background: var(--series-1); color: #fff; border-color: transparent; width: 100%; padding: 9px; margin-top: 18px; }
   .primary:hover { filter: brightness(1.08); background: var(--series-1); }
+  button:disabled { opacity: 0.62; cursor: progress; }
+  .primary:disabled:hover { filter: none; }
   .hidden { display: none !important; }
   .empty { color: var(--text-secondary); font-size: 13px; padding: 8px 0 16px; }
 </style>
@@ -447,16 +449,41 @@ function showLogin() {
 document.getElementById("login-form").addEventListener("submit", async e => {
   e.preventDefault();
   const err = document.getElementById("login-err");
+  const btn = e.currentTarget.querySelector("button[type=submit]");
   err.textContent = "";
+
+  // Signing in is instant; reading the archive behind it is not necessarily so
+  // on a first run over a few hundred thousand lines. Without a visible
+  // pending state the page changes nothing at all for that whole stretch, and
+  // a working login is indistinguishable from a dead button.
+  btn.disabled = true;
+  btn.textContent = "Signing in...";
   try {
     await api("/v1/login", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({password: document.getElementById("password").value}),
     });
-    await load();
   } catch (_) {
     err.textContent = "That key was not accepted.";
+    return;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Sign in";
+  }
+
+  // Past this point the key was accepted, so a failure here is the archive
+  // read, not the credential. Saying "that key was not accepted" would send
+  // you off to re-check a key that was fine.
+  btn.disabled = true;
+  btn.textContent = "Reading the archive...";
+  try {
+    await load();
+  } catch (_) {
+    err.textContent = "Signed in, but this node's archive could not be read.";
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Sign in";
   }
 });
 
