@@ -49,6 +49,24 @@ const Interval = 30 * time.Second
 // because a beacon authorises nothing.
 const EpochSeconds = 300
 
+// joinAnnouncements are extra announcements a node makes just after joining,
+// measured from the moment it joined.
+//
+// Announcing once and then every Interval discovers in one direction only when
+// two nodes start moments apart: the first announced before the second had
+// joined the group, so that announcement reached nobody, and its next one is a
+// full interval away. The second node is therefore visible immediately while
+// the first stays invisible for up to thirty seconds -- and a node that has
+// just started is precisely the one with no stored peers to fall back on.
+//
+// Repeating a few times closes the window without making the steady state
+// chattier: a beacon is a few hundred bytes, and this is three of them.
+var joinAnnouncements = []time.Duration{
+	500 * time.Millisecond,
+	2 * time.Second,
+	5 * time.Second,
+}
+
 // interfaceScanInterval is how often the interface set is re-examined.
 //
 // There is no portable API for interface-change notification, so this polls.
@@ -149,17 +167,49 @@ func (b *Beacon) Run(ctx context.Context, found func(Peer)) error {
 	defer scan.Stop()
 
 	b.announce(pc, joined)
+
+	// Repeat shortly after joining; see joinAnnouncements.
+	rejoinAt := 0
+	joinTimer := time.NewTimer(joinAnnouncements[0])
+	defer joinTimer.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-joinTimer.C:
+			b.announce(pc, joined)
+			if rejoinAt++; rejoinAt < len(joinAnnouncements) {
+				joinTimer.Reset(joinAnnouncements[rejoinAt] - joinAnnouncements[rejoinAt-1])
+			}
 		case <-announce.C:
 			b.announce(pc, joined)
 		case <-scan.C:
 			// The interface set changes on sleep/wake, VPN up/down and DHCP.
+			before := joined
 			joined = b.rejoin(pc, joined)
+			if !sameInterfaces(before, joined) {
+				// A new interface has nobody's announcement on it yet, and
+				// waiting out the interval would hide this node for that long
+				// on the network it just joined -- which is exactly the moment
+				// after a resume or a VPN coming up.
+				b.announce(pc, joined)
+			}
 		}
 	}
+}
+
+// sameInterfaces reports whether two joined sets are the same.
+func sameInterfaces(a, b []net.Interface) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for _, ifi := range a {
+		if !containsInterface(b, ifi) {
+			return false
+		}
+	}
+	return true
 }
 
 // rejoin joins the group on every eligible interface, leaving those that went
