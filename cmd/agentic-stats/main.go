@@ -58,6 +58,9 @@ Usage:
   agentic-stats run      Collect continuously and serve the dashboard
   agentic-stats status   Report what this node holds
 
+  agentic-stats reprocess  Re-read archived records for columns this build
+                           extracts and older ones did not
+
   agentic-stats install    Start automatically when you log in
   agentic-stats uninstall  Remove the autostart entry
   agentic-stats service    Report whether the autostart entry is running
@@ -101,6 +104,8 @@ func run(args []string) error {
 		return runNode(args[1:], defaultPath, modeRun)
 	case "status":
 		return runStatus(args[1:], defaultPath)
+	case "reprocess":
+		return runReprocess(args[1:], defaultPath)
 	case "install":
 		return runInstall(args[1:], defaultPath)
 	case "uninstall":
@@ -184,6 +189,60 @@ func runJoin(args []string, defaultPath string) error {
 	return runInit(forward, defaultPath, *key)
 }
 
+// runReprocess re-reads archived records for the columns this build extracts.
+//
+// `run` does this by itself, so this exists for the impatient and for a node
+// that only ever runs `once` from a scheduler. It is safe alongside a running
+// daemon: the writes are small transactions and SQLite's busy timeout absorbs
+// the collisions.
+func runReprocess(args []string, defaultPath string) error {
+	fs := flag.NewFlagSet("reprocess", flag.ExitOnError)
+	configPath := fs.String("config", defaultPath, "configuration file")
+	statePath := fs.String("state", "", "archive database path")
+	batch := fs.Int("batch", ingest.DefaultReprocessBatch, "records per transaction")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	ctx := context.Background()
+	// A foreground command, so the log goes to the terminal that asked for it.
+	// It carries the migration line, which is the only explanation a first run
+	// after an upgrade offers for a long silence.
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	// readOnly parts on purpose: the cursor store is single-process bbolt and a
+	// running daemon holds it. This command writes to the archive, not to it.
+	n, err := openNodeWith(ctx, *configPath, *statePath, log, readOnly)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = n.Close() }() // reported below; the pass has already committed
+
+	redo, err := ingest.NewReprocessor(ingest.ReprocessConfig{
+		Archive: n.db,
+		Keys:    n.keys,
+		Logger:  log,
+		Batch:   *batch,
+	})
+	if err != nil {
+		return err
+	}
+	stats, err := redo.Pass(ctx)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("examined %d records, updated %d\n", stats.Examined, stats.Updated)
+	if stats.Unreadable > 0 {
+		// Said plainly rather than logged and forgotten. It means this node
+		// holds records sealed with a key it does not have, so nothing can be
+		// derived from them and they will report as having no project for as
+		// long as that is true. Nothing else surfaces this.
+		fmt.Printf("%d records could not be unsealed with this node's key, so nothing "+
+			"could be read\nfrom them; check that every machine joined the mesh with "+
+			"the same key\n", stats.Unreadable)
+	}
+	return nil
+}
+
 // node bundles everything a running node needs.
 type node struct {
 	cfg    agentcfg.Config
@@ -191,6 +250,7 @@ type node struct {
 	db     *store.DB
 	derive *derive.Service
 	coll   *collector.Collector
+	redo   *ingest.Reprocessor
 	mesh   *mesh.Mesh
 	bridge *bridge.Bridge
 	log    *slog.Logger
@@ -233,7 +293,10 @@ func openNodeWith(ctx context.Context, configPath, statePath string, log *slog.L
 	if statePath == "" {
 		statePath = filepath.Join(filepath.Dir(configPath), "archive.db")
 	}
-	if n.db, err = store.Open(ctx, store.Config{Path: statePath}); err != nil {
+	// The logger matters here: a migration that rebuilds an index scans the
+	// whole archive, which on a multi-gigabyte file is a wait inside Open that
+	// would otherwise look like a hang.
+	if n.db, err = store.Open(ctx, store.Config{Path: statePath, Logger: log}); err != nil {
 		return nil, err
 	}
 	n.closes = append(n.closes, n.db.Close)
@@ -258,6 +321,13 @@ func openNodeWith(ctx context.Context, configPath, statePath string, log *slog.L
 
 	writer, err := ingest.NewWriter(n.db, keys)
 	if err != nil {
+		return nil, n.closeAll(err)
+	}
+	if n.redo, err = ingest.NewReprocessor(ingest.ReprocessConfig{
+		Archive: n.db,
+		Keys:    keys,
+		Logger:  log,
+	}); err != nil {
 		return nil, n.closeAll(err)
 	}
 
@@ -477,6 +547,11 @@ func runNode(args []string, defaultPath string, m mode) error {
 		{Name: "dashboard", Run: func(ctx context.Context) error {
 			return n.serveDashboard(ctx, addr, *configPath, log)
 		}},
+		// Records collected before this build knew to extract a column carry
+		// none, so the reports that read it are wrong about the past until this
+		// has run. It has to be automatic for that reason: nobody reads release
+		// notes to discover that a chart needs a subcommand to become correct.
+		{Name: "reprocess", Run: n.redo.Run},
 	}
 	if n.mesh != nil {
 		subsystems = append(subsystems, supervise.Config{Name: "peering", Run: n.mesh.Run})
@@ -655,10 +730,17 @@ func runStatus(args []string, defaultPath string) error {
 	if err != nil {
 		return err
 	}
+	pending, err := n.db.ExtractionPending(ctx, ingest.ExtractionVersion)
+	if err != nil {
+		return err
+	}
 
 	fmt.Printf("origin   %s\n", n.db.OriginID())
 	fmt.Printf("service  %s\n", serviceSummary())
 	fmt.Printf("records  %d\n", count)
+	// Printed even at zero, so it reads as a positive statement rather than
+	// leaving "why does my chart still say No project" unanswerable.
+	fmt.Printf("pending  %d records to re-read for newly extracted columns\n", pending)
 	fmt.Printf("origins  %d\n", len(vec))
 	for origin, seq := range vec {
 		marker := ""
@@ -693,7 +775,7 @@ func runStatus(args []string, defaultPath string) error {
 
 	if quarantined > 0 {
 		fmt.Printf("\nWARNING: %d quarantined records.\n", quarantined)
-		fmt.Println("Two machines are issuing records under the same origin id â€” most likely a")
+		fmt.Println("Two machines are issuing records under the same origin id — most likely a")
 		fmt.Println("cloned VM or a copied database. Their data is being kept, not merged.")
 	}
 	return nil

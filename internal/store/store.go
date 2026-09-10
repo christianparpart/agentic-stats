@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"sort"
 	"strconv"
 	"sync"
@@ -44,12 +45,22 @@ type Config struct {
 	Path string
 	// Clock supplies timestamps. Zero uses the system clock.
 	Clock func() time.Time
+	// Logger records which migration is being applied. Zero discards.
+	//
+	// Worth a dependency of its own: a migration that rebuilds an index has to
+	// scan the whole archive, which on a multi-gigabyte file is seconds to
+	// minutes inside Open -- so `run`, `status` and the installed service all
+	// stall once, silently, on the first start after an upgrade. A named line
+	// in the log is the difference between a known wait and a process that
+	// looks hung.
+	Logger *slog.Logger
 }
 
 // DB is the local replica.
 type DB struct {
 	sql    *sql.DB
 	now    func() time.Time
+	log    *slog.Logger
 	origin string
 
 	// writeMu serializes write transactions.
@@ -90,7 +101,12 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		return nil, errors.Join(fmt.Errorf("store: ping %s: %w", cfg.Path, err), handle.Close())
 	}
 
-	db := &DB{sql: handle, now: now}
+	log := cfg.Logger
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
+	}
+
+	db := &DB{sql: handle, now: now, log: log}
 	if err := db.migrate(ctx); err != nil {
 		return nil, errors.Join(err, handle.Close())
 	}
@@ -196,6 +212,9 @@ func (db *DB) migrate(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("store: read migration %s: %w", name, err)
 		}
+		// Before, not after: the point of the line is to explain a wait that
+		// has not finished yet.
+		db.log.Info("applying migration", "name", name)
 		// The migration and its record commit together, so a failure part-way
 		// leaves neither the change nor the claim that it was applied.
 		err = db.inTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
