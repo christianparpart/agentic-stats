@@ -2,6 +2,7 @@ package integration_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"testing"
@@ -14,12 +15,31 @@ import (
 // than one bar. Everything else here fixes a single timestamp, which is why no
 // test could see the daily report split anything until now.
 func dayLine(date, session, requestID, model string, output int64) string {
+	return dayLineIn(date, `D:\fastcached`, "master", session, requestID, model, output)
+}
+
+// dayLineIn is dayLine with the provenance a project and a branch are read
+// from. A separate helper rather than four more parameters on every caller: the
+// tests that care about where work happened are the minority.
+func dayLineIn(date, cwd, branch, session, requestID, model string, output int64) string {
 	return fmt.Sprintf(`{"type":"assistant","requestId":%q,"uuid":%q,"sessionId":%q,`+
+		`"cwd":%s,"gitBranch":%q,`+
 		`"timestamp":"%sT12:00:00.000Z","message":{"model":%q,`+
 		`"usage":{"input_tokens":10,"output_tokens":%d,"cache_read_input_tokens":100,`+
 		`"output_tokens_details":{"thinking_tokens":5},`+
 		`"cache_creation":{"ephemeral_5m_input_tokens":10,"ephemeral_1h_input_tokens":0}}}}`,
-		requestID, requestID+"-u", session, date, model, output)
+		requestID, requestID+"-u", session, mustJSON(cwd), branch, date, model, output)
+}
+
+// mustJSON quotes a value the way the transcript does. Needed for the working
+// directory alone: a Windows path is full of backslashes and %q would render
+// them as Go escapes rather than JSON ones.
+func mustJSON(v string) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
 }
 
 // stackTotals sums a day's shares per dimension.
@@ -38,6 +58,19 @@ func shareOf(d derive.Day, stack derive.Stack, key string) float64 {
 		}
 	}
 	return 0
+}
+
+// labelOf is how a segment reads to a person, which for the two segments that
+// are not categories is the whole assertion.
+func labelOf(t *testing.T, a derive.Activity, stack derive.Stack, key string) string {
+	t.Helper()
+	for _, seg := range legendFor(t, a, stack).Segments {
+		if seg.Key == key {
+			return seg.Label
+		}
+	}
+	t.Fatalf("no %q segment in the %q legend", key, stack)
+	return ""
 }
 
 func legendFor(t *testing.T, a derive.Activity, stack derive.Stack) derive.Legend {
@@ -65,8 +98,9 @@ func TestEveryStackSumsToTheDaysCost(t *testing.T) {
 		dayLine("2026-09-02", "s-gamma", "r4", "claude-opus-5", 250),
 		prLink("s-alpha", "acme/widgets", 1),
 		prLink("s-beta", "acme/gadgets", 2),
-		// s-gamma shipped nothing, so it lands in the unattributed segment
-		// rather than being guessed at.
+		// s-gamma shipped nothing, so it lands in the unattributed segment of
+		// the pull-request stack. It still has a project: every line says which
+		// directory it ran in.
 	)); err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
@@ -78,7 +112,7 @@ func TestEveryStackSumsToTheDaysCost(t *testing.T) {
 	if len(activity.Days) != 2 {
 		t.Fatalf("got %d days, want 2", len(activity.Days))
 	}
-	if len(activity.Legends) != 5 {
+	if len(activity.Legends) != 6 {
 		t.Fatalf("got %d legends, want one per dimension", len(activity.Legends))
 	}
 
@@ -122,11 +156,15 @@ func TestDaysAreSeparateAndOldestFirst(t *testing.T) {
 	}
 }
 
-// A session that shipped to two repositories did work for both, and there is
+// A session that opened two pull requests did work for both, and there is
 // nothing saying how to divide it -- so it splits evenly, the same rule the
 // delivery card uses. Attributing it whole to each would inflate the total,
 // which is the double-count the requestId fold exists to prevent.
-func TestASessionShippingToTwoRepositoriesSplitsEvenly(t *testing.T) {
+//
+// This is the pull-request dimension's rule and only its own. A project is read
+// from each record's working directory, so a row belongs to exactly one and
+// there is nothing to allocate.
+func TestASessionShippingToTwoPullRequestsSplitsEvenly(t *testing.T) {
 	n := newNode(t)
 	ctx := context.Background()
 
@@ -146,8 +184,8 @@ func TestASessionShippingToTwoRepositoriesSplitsEvenly(t *testing.T) {
 	}
 	d := activity.Days[0]
 
-	widgets := shareOf(d, derive.StackProject, "acme/widgets")
-	gadgets := shareOf(d, derive.StackProject, "acme/gadgets")
+	widgets := shareOf(d, derive.StackPullRequest, "acme/widgets#1")
+	gadgets := shareOf(d, derive.StackPullRequest, "acme/gadgets#2")
 	if widgets <= 0 || math.Abs(widgets-gadgets) > 1e-9 {
 		t.Errorf("split = %v and %v, want two equal halves", widgets, gadgets)
 	}
@@ -156,15 +194,21 @@ func TestASessionShippingToTwoRepositoriesSplitsEvenly(t *testing.T) {
 	}
 }
 
-// Work that never opened a pull request has no project. Saying so is the
-// point: the alternative is inventing one.
-func TestWorkWithoutAPullRequestIsNotAttributed(t *testing.T) {
+// Work that never opened a pull request is not attributed to one. Saying so is
+// the point: the alternative is inventing one.
+//
+// What it must no longer do is cost that work its project. Most work opens no
+// pull request, and for as long as a project meant "the repository this
+// session's pull requests went to", most of the archive was attributed to
+// nothing at all -- one enormous segment labelled "No pull request", which is
+// what prompted all of this.
+func TestWorkWithoutAPullRequestStillHasAProject(t *testing.T) {
 	n := newNode(t)
 	ctx := context.Background()
 
 	if _, err := n.writer.Ingest(ctx, records(
-		dayLine("2026-09-01", "s-shipped", "r1", "claude-opus-5", 1000),
-		dayLine("2026-09-01", "s-explored", "r2", "claude-opus-5", 1000),
+		dayLineIn("2026-09-01", `D:\fastcached`, "master", "s-shipped", "r1", "claude-opus-5", 1000),
+		dayLineIn("2026-09-01", `D:\fastcached`, "master", "s-explored", "r2", "claude-opus-5", 1000),
 		prLink("s-shipped", "acme/widgets", 1),
 	)); err != nil {
 		t.Fatalf("Ingest: %v", err)
@@ -175,16 +219,117 @@ func TestWorkWithoutAPullRequestIsNotAttributed(t *testing.T) {
 	}
 	d := activity.Days[0]
 
-	if got := shareOf(d, derive.StackProject, derive.NoneKey); got <= 0 {
+	// The pull-request stack still says so, and still by that name.
+	if got := shareOf(d, derive.StackPullRequest, derive.NoneKey); got <= 0 {
 		t.Errorf("the unshipped session contributed %v to the unattributed segment, want its cost", got)
 	}
-	for _, seg := range legendFor(t, activity, derive.StackProject).Segments {
-		if seg.Key != derive.NoneKey {
-			continue
-		}
-		if seg.Label != "No pull request" {
-			t.Errorf("unattributed segment is labelled %q", seg.Label)
-		}
+	if got := labelOf(t, activity, derive.StackPullRequest, derive.NoneKey); got != "No pull request" {
+		t.Errorf("the pull-request stack labels its empty segment %q", got)
+	}
+
+	// The project stack does not: both sessions worked on fastcached.
+	if got := shareOf(d, derive.StackProject, "fastcached"); math.Abs(got-d.CostUSD) > 1e-9 {
+		t.Errorf("fastcached got $%.6f of the day, want all $%.6f", got, d.CostUSD)
+	}
+	if got := shareOf(d, derive.StackProject, derive.NoneKey); got != 0 {
+		t.Errorf("$%.6f was attributed to no project", got)
+	}
+}
+
+// A record that carries no working directory at all has no project, and must
+// say that rather than borrow one.
+func TestWorkWithoutAWorkingDirectoryHasNoProject(t *testing.T) {
+	n := newNode(t)
+	ctx := context.Background()
+
+	if _, err := n.writer.Ingest(ctx, records(
+		dayLineIn("2026-09-01", "", "", "s-nowhere", "r1", "claude-opus-5", 1000),
+	)); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	activity, err := n.derive.Daily(ctx)
+	if err != nil {
+		t.Fatalf("Daily: %v", err)
+	}
+	d := activity.Days[0]
+
+	if got := shareOf(d, derive.StackProject, derive.NoneKey); math.Abs(got-d.CostUSD) > 1e-9 {
+		t.Errorf("unattributed got $%.6f, want the day's $%.6f", got, d.CostUSD)
+	}
+	// Its own name, not the pull request's: these are different absences, and
+	// sharing one label was how the old rule hid behind the new one's excuse.
+	if got := labelOf(t, activity, derive.StackProject, derive.NoneKey); got != "No project" {
+		t.Errorf("the project stack labels its empty segment %q", got)
+	}
+	if got := labelOf(t, activity, derive.StackBranch, derive.NoneKey); got != "No branch" {
+		t.Errorf("the branch stack labels its empty segment %q", got)
+	}
+}
+
+// Every worktree of a project is that project. Without this the chart shatters:
+// this author's archive holds 68 distinct directories for one repository, most
+// of them created by the assistant itself, and each would take a slice of the
+// bar and push the real projects into Other.
+func TestWorktreesFoldIntoTheirProject(t *testing.T) {
+	n := newNode(t)
+	ctx := context.Background()
+
+	if _, err := n.writer.Ingest(ctx, records(
+		dayLineIn("2026-09-01", `D:\fastcached`, "master", "s1", "r1", "claude-opus-5", 500),
+		dayLineIn("2026-09-01", `D:\fastcached\.claude\worktrees\agent-a0c5d2774e77a518f`,
+			"claude/x", "s2", "r2", "claude-opus-5", 500),
+		dayLineIn("2026-09-01", `D:\fastcached-issue-154`, "feature/154", "s3", "r3", "claude-opus-5", 500),
+		dayLineIn("2026-09-01", `D:\endo`, "master", "s4", "r4", "claude-opus-5", 500),
+	)); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	activity, err := n.derive.Daily(ctx)
+	if err != nil {
+		t.Fatalf("Daily: %v", err)
+	}
+	d := activity.Days[0]
+
+	if got := len(d.Stacks[derive.StackProject]); got != 2 {
+		t.Fatalf("the day divides into %d projects, want fastcached and endo", got)
+	}
+	fastcached := shareOf(d, derive.StackProject, "fastcached")
+	endo := shareOf(d, derive.StackProject, "endo")
+	if math.Abs(fastcached-3*endo) > 1e-9 {
+		t.Errorf("fastcached got $%.6f and endo $%.6f; want three of the four rows folded together",
+			fastcached, endo)
+	}
+	if total := fastcached + endo; math.Abs(total-d.CostUSD) > 1e-9 {
+		t.Errorf("projects sum to $%.6f, want the day's $%.6f", total, d.CostUSD)
+	}
+}
+
+// The branch is what tells apart the work that opened no pull request, which is
+// why it is worth a dimension of its own.
+func TestTheBranchStackSeparatesTheBranches(t *testing.T) {
+	n := newNode(t)
+	ctx := context.Background()
+
+	if _, err := n.writer.Ingest(ctx, records(
+		dayLineIn("2026-09-01", `D:\fastcached`, "master", "s1", "r1", "claude-opus-5", 1000),
+		dayLineIn("2026-09-01", `D:\fastcached`, "feature/139-toolchain", "s2", "r2", "claude-opus-5", 1000),
+	)); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	activity, err := n.derive.Daily(ctx)
+	if err != nil {
+		t.Fatalf("Daily: %v", err)
+	}
+	d := activity.Days[0]
+
+	master := shareOf(d, derive.StackBranch, "master")
+	feature := shareOf(d, derive.StackBranch, "feature/139-toolchain")
+	if master <= 0 || math.Abs(master-feature) > 1e-9 {
+		t.Errorf("branches got $%.6f and $%.6f, want the two halves", master, feature)
+	}
+	// One project, two branches: the dimensions have to divide the same day
+	// differently without either losing any of it.
+	if got := shareOf(d, derive.StackProject, "fastcached"); math.Abs(got-d.CostUSD) > 1e-9 {
+		t.Errorf("fastcached got $%.6f, want the whole day's $%.6f", got, d.CostUSD)
 	}
 }
 

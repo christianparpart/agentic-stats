@@ -61,7 +61,7 @@ func newNodeWithKey(t *testing.T, psk string) *node {
 	if err != nil {
 		t.Fatalf("pricing.Load: %v", err)
 	}
-	svc, err := derive.NewService(db, prices)
+	svc, err := derive.NewService(derive.Config{Store: db, Prices: prices})
 	if err != nil {
 		t.Fatalf("derive.NewService: %v", err)
 	}

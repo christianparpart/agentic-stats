@@ -65,10 +65,23 @@ continues appending there. The same `sessionId` and `uuid`s then exist in two fi
 Deduplicate on `(session_id, uuid)`, never on path, and attribute the project from the
 record's own `cwd`.
 
+Both halves are implemented: the dedup as the `records_semantic_uuid` index, and the
+attribution as `derive.Identify` -> the `records.cwd` column -> `derive`'s project fold. The
+fold also collapses the worktree *directory* back to its project, by two rules -- the
+assistant's own `<project>/.claude/worktrees/<name>` layout, which is exact, and a sibling
+directory suffixed with an issue or worktree marker, which is a convention. Both live in a
+table in `derive`, deliberately not in configuration: configuration is per machine and
+nothing in the mesh exchanges it, so two nodes with different tables would draw different
+project legends from identical archives.
+
 ### 4. The project directory name is lossy
 
 Project directories encode the working directory with both `/` and `.` mapped to `-`, so the
 encoding is not invertible. Use the `cwd` field inside records as ground truth.
+
+Because records replicate between machines, the `cwd` fold must also treat `/` and `\` as
+equivalent on every host. `path/filepath` follows the local OS and would therefore give two
+nodes two different answers for the same string.
 
 ### 5. Timestamps do not order the file
 
@@ -138,6 +151,10 @@ from the payload.
 
 Detached-HEAD and empty branch values mean "unknown", not a branch named `HEAD`. Assistant-
 generated worktree branches fold back to the originating branch.
+
+The branch is extracted into `records.git_branch` and stacks the daily chart. The directory
+fold described in trap 3 exists; the branch fold does not yet, and neither does the
+branch->issue mapping above.
 
 ## Timezones
 

@@ -242,7 +242,7 @@ func openNodeWith(ctx context.Context, configPath, statePath string, log *slog.L
 	if err != nil {
 		return nil, n.closeAll(err)
 	}
-	if n.derive, err = derive.NewService(n.db, prices); err != nil {
+	if n.derive, err = derive.NewService(derive.Config{Store: n.db, Prices: prices}); err != nil {
 		return nil, n.closeAll(err)
 	}
 
@@ -693,7 +693,7 @@ func runStatus(args []string, defaultPath string) error {
 
 	if quarantined > 0 {
 		fmt.Printf("\nWARNING: %d quarantined records.\n", quarantined)
-		fmt.Println("Two machines are issuing records under the same origin id — most likely a")
+		fmt.Println("Two machines are issuing records under the same origin id â€” most likely a")
 		fmt.Println("cloned VM or a copied database. Their data is being kept, not merged.")
 	}
 	return nil
