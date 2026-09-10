@@ -78,14 +78,31 @@ order:
    a repository from a project of its own. It may only *shorten* a path to something the path
    already names, never rename it — working in one repository and shipping to another is
    ordinary. Repositories that disagree fold nothing.
-3. A sibling directory suffixed with an issue or worktree marker. A convention, and the
+3. Containment: a directory that sits inside another working directory belongs to that one's
+   project. A `cwd` is not always a repository root — `fastcached\out\build\cl-release` and
+   `Lastrada\out\build\win64-cl-ninja-release` are both real — and this is what stops a build
+   tree becoming a project named after its configuration. Only an ancestor that is itself a
+   project may claim a directory: a filesystem root contains everything and is not one, and
+   `D:\` is a working directory in a real archive.
+4. A sibling directory suffixed with an issue or worktree marker. A convention, and the
    dimension's note says so.
 
-None consults the filesystem or the local path separator, and none depends on what else the
-archive holds beyond the pull requests of the sessions in question — so a `cwd` collected on
-another machine folds identically here. The tables live in `derive`, deliberately not in
-configuration: configuration is per machine and nothing in the mesh exchanges it, so two
-nodes with different tables would draw different project legends from identical archives.
+A list of build-directory names was considered for rule 3 and rejected: `out`, `build` and
+`target` miss `src\apps\…` and `plugins\…`, and a list long enough to catch those would
+eventually swallow a project genuinely called `src`. Being *inside* a project is the property
+that matters, and the archive knows it.
+
+None consults the filesystem or the local path separator, so a `cwd` collected on another
+machine folds identically here. Rules 2 and 3 do read the rest of the archive — the pull
+requests of the sessions in question, and which other directories exist — which keeps the
+property the legend rests on: replicas holding the same records agree, because both are
+functions of the records. Two nodes mid-convergence may differ and then converge, as the
+daily report already does while re-extraction runs. What stays refused is inferring a project
+from *name similarity* to another directory, which reads a coincidence rather than a fact.
+
+The tables live in `derive`, deliberately not in configuration: configuration is per machine
+and nothing in the mesh exchanges it, so two nodes with different tables would draw different
+project legends from identical archives.
 
 ### 4. The project directory name is lossy
 

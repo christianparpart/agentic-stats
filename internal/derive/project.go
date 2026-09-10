@@ -3,6 +3,7 @@ package derive
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -66,17 +67,28 @@ var worktreeWords = map[string]struct{}{
 	"pr": {}, "branch": {}, "agent": {},
 }
 
-// projectRules turns a working directory into a project name.
+// projectRules turns working directories into project names.
 //
-// It is a pure function of one path string and this table -- no filesystem, no
-// hostname, and above all no knowledge of what else the archive holds. That is
-// load-bearing twice over. A rule that consulted the local disk could not be
-// recomputed from a body collected on another machine, and a rule that learned
-// its project names from the records would give two replicas different answers
-// while they were still converging: a node holding only fastcached-wt-139 would
-// show it as its own project, and a node that had also received fastcached
-// would not. Replicas that agree must not look like they disagree, so there is
-// nothing here to learn from and nothing to iterate.
+// Nothing here consults the filesystem or the host's own path separator. That
+// is load-bearing: a rule that looked at the local disk could not be applied to
+// a directory collected on another machine, and half of them do not exist here.
+//
+// Two entry points, and the difference matters. `of` is a pure function of one
+// path -- name conventions and whatever the pull requests say. `resolve` folds
+// a whole set at once, because containment cannot be decided one path at a
+// time: whether `D:\p\out\build` is a project depends on whether `D:\p` is one.
+//
+// So `resolve` does depend on which directories the archive holds, and that is
+// a deliberate, bounded departure. The property the legend actually rests on is
+// that *replicas holding the same records agree*, and it still holds: the set
+// of directories is a function of the records. Two nodes mid-convergence may
+// briefly differ and then converge, exactly as the daily report already does
+// while re-extraction is still running.
+//
+// What is still refused is a rule that would learn project *names* from
+// similarity -- folding `fastcached-wt-139` because some other directory
+// happens to be called `fastcached`. That is inference from a coincidence
+// rather than a fact about a path, and it is why the suffix table stays narrow.
 type projectRules struct {
 	layouts  []worktreeLayout
 	suffixes []*regexp.Regexp
@@ -114,11 +126,118 @@ func (r projectRules) of(cwd string, shippedTo []string) string {
 	if p := shippedProject(segs, shippedTo); p != "" {
 		return p
 	}
+	return r.nameProject(segs)
+}
+
+// nameProject is the last resort: what the directory calls itself, with a
+// sibling worktree suffix folded away.
+func (r projectRules) nameProject(segs []string) string {
+	if len(segs) == 0 {
+		return ""
+	}
 	name := segs[len(segs)-1]
 	if isRoot(name) {
 		return ""
 	}
 	return r.foldSibling(name)
+}
+
+// resolve gives every working directory its project, folding one that sits
+// inside another onto the project that contains it.
+//
+// Containment is the rule that needs no evidence and no naming convention, and
+// it is what makes the others' gaps survivable. A working directory is not
+// always a repository root -- `D:\fastcached\out\build\cl-release` and
+// `D:\Lastrada\out\build\win64-cl-ninja-release` are both real, and without
+// this they become projects named after a build tree. There is no list of
+// directory names that fixes it: `out`, `build` and `target` would miss
+// `src\apps\...` and `plugins\...`, and a stoplist long enough to catch those
+// would eventually swallow a project genuinely called `src`. Being *inside* a
+// project is the property that actually matters, and the archive knows it.
+//
+// Only an ancestor that is itself a project may claim a directory. A filesystem
+// root contains everything and is not a project, and `D:\` is a working
+// directory in a real archive -- folding onto it moved every top-level project
+// into "no project" when this was first tried.
+//
+// Pull-request evidence comes first, so a repository nested inside another that
+// ships on its own account stays its own project. Containment only takes over
+// where nothing exact is known.
+//
+// The answer depends on the set of directories, so it depends on the records --
+// which is the property the legend already requires: replicas holding the same
+// records agree. Two nodes mid-convergence may differ for as long as one is
+// missing records, and then converge, like every other report here.
+func (r projectRules) resolve(dirs []string, shipped map[string][]string) map[string]string {
+	type entry struct {
+		dir  string
+		segs []string
+		key  string
+	}
+	entries := make([]entry, 0, len(dirs))
+	for _, dir := range dirs {
+		segs := r.stripWorktree(pathSegments(dir))
+		entries = append(entries, entry{dir: dir, segs: segs, key: segmentKey(segs)})
+	}
+	// Shortest first, so a directory's ancestors are always resolved before it
+	// and one pass suffices; then by name, so the order is total and two nodes
+	// walk the same directories in the same order.
+	sort.Slice(entries, func(i, j int) bool {
+		if len(entries[i].segs) != len(entries[j].segs) {
+			return len(entries[i].segs) < len(entries[j].segs)
+		}
+		return entries[i].dir < entries[j].dir
+	})
+
+	out := make(map[string]string, len(dirs))
+	projects := make(map[string]string, len(dirs))
+	for _, e := range entries {
+		project := shippedProject(e.segs, shipped[e.dir])
+		if project == "" {
+			project = ancestorProject(e.segs, projects)
+		}
+		if project == "" {
+			project = r.nameProject(e.segs)
+		}
+		out[e.dir] = project
+		// Only a directory that is a project can contain one. First writer
+		// wins, which the sort above makes deterministic.
+		if _, taken := projects[e.key]; !taken && project != "" {
+			projects[e.key] = project
+		}
+	}
+	return out
+}
+
+// ancestorProject returns the project of the nearest enclosing directory that
+// has one, and "" when nothing encloses this path.
+func ancestorProject(segs []string, projects map[string]string) string {
+	// Nearest first: the innermost enclosing project is the one that owns the
+	// directory, which matters once a repository contains another.
+	for cut := len(segs) - 1; cut > 0; cut-- {
+		if p := projects[segmentKey(segs[:cut])]; p != "" {
+			return p
+		}
+	}
+	return ""
+}
+
+// segmentKey identifies a path by its segments, for comparing one path against
+// another.
+//
+// Case-folded, because Windows and macOS both treat `D:\Foo` and `d:\foo` as
+// one directory and a machine that spells one of them differently must not be
+// read as working somewhere else. Joined on a byte that cannot occur in a path
+// segment, so `a\b` and `a-b` cannot collide however the segments are split.
+func segmentKey(segs []string) string {
+	var b strings.Builder
+	for i, seg := range segs {
+		if i > 0 {
+			b.WriteByte(0)
+		}
+		b.WriteString(strings.ToLower(seg))
+	}
+	return b.String()
 }
 
 // shippedProject folds a directory onto the repository its work demonstrably
