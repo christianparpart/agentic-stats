@@ -96,6 +96,49 @@ Open the dashboard and sign in with the mesh key. It shows cost, cache savings, 
 hit rate, cost per active day and a per-model breakdown; `/v1/summary` and `/v1/daily`
 return the same figures as JSON.
 
+## Knowing it works
+
+`agentic-stats status` and `/v1/health` answer the question that matters for an
+archive: not whether peers are reachable, but whether data is actually moving. For
+each peer they report when it last **converged**, how far **behind or ahead** this
+node is as of that exchange, and why the last attempt failed if it did.
+
+Last-seen is deliberately not the measure. A peer announcing itself every thirty
+seconds while every exchange with it fails is the failure worth catching, and it
+looks perfectly healthy by any other signal.
+
+```sh
+./bin/agentic-stats status         # per-peer convergence, and a warning if one has stalled
+curl .../v1/health                 # the same, as JSON, with an overall ok/degraded verdict
+curl .../healthz                   # liveness only, and deliberately uninformative
+```
+
+`/v1/health` needs the mesh key, because peer identities, addresses and lag amount
+to a map of your fleet. `/healthz` does not, which is why it says nothing else.
+
+A peer that is switched off is not a fault — that is a laptop in a bag — so it is
+reported, not alarmed about. A node whose exchanges are failing, or that holds
+quarantined records, reads as `degraded`.
+
+## Surviving the network
+
+The daemon assumes the network misbehaves, because on laptops and VMs it does:
+
+- **Suspend and resume.** A wall-clock jump is treated as a resume: peer backoff is
+  discarded and a sweep runs immediately, rather than waiting out a timer learned
+  on a network the machine may no longer be attached to. Wall clock rather than
+  monotonic because the three platforms disagree about whether monotonic time
+  advances across a suspend.
+- **Half-open connections.** Every read and write carries an idle deadline, and TCP
+  keepalive is set explicitly rather than inherited, so a peer that vanished
+  mid-exchange is reaped in about a minute instead of hours.
+- **Subsystem failure.** Collection, the dashboard, peering and the bridge are
+  supervised separately and restart with backoff. A mesh listener that cannot bind
+  after resume no longer takes collection down with it. Genuine misconfiguration
+  still exits immediately rather than looping.
+- **A bad frame from a peer.** Contained to that exchange and logged with its stack,
+  rather than ending the process that is holding your only off-machine copy.
+
 The dashboard binds to loopback by default, where `http://127.0.0.1` is already a secure
 context in every browser -- no certificate to manage and no warning. Binding it elsewhere
 turns on HTTPS with a self-signed certificate.
