@@ -321,3 +321,63 @@ func TestEveryConnectionBoundsTheWriteAheadLog(t *testing.T) {
 		}
 	}
 }
+
+// The name a machine reports for itself outlives a failed reverse lookup, and
+// a peer too old to report one must not erase what an upgraded one said.
+func TestPeerHostnameIsKeptAndNeverErasedBySilence(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+
+	if err := db.SavePeer(ctx, store.Peer{ID: "p1", Addrs: []string{"192.168.86.24:8844"}}); err != nil {
+		t.Fatalf("SavePeer: %v", err)
+	}
+	if err := db.SavePeerHostname(ctx, "p1", "darkleon"); err != nil {
+		t.Fatalf("SavePeerHostname: %v", err)
+	}
+
+	names, err := db.PeerNames(ctx)
+	if err != nil {
+		t.Fatalf("PeerNames: %v", err)
+	}
+	if names["p1"] != "darkleon" {
+		t.Errorf("PeerNames[p1] = %q, want %q", names["p1"], "darkleon")
+	}
+
+	// An exchange with a node that reports no name at all.
+	if err := db.SavePeerHostname(ctx, "p1", ""); err != nil {
+		t.Fatalf("SavePeerHostname with no name: %v", err)
+	}
+	peers, err := db.Peers(ctx)
+	if err != nil {
+		t.Fatalf("Peers: %v", err)
+	}
+	if len(peers) != 1 {
+		t.Fatalf("got %d peers, want 1", len(peers))
+	}
+	if peers[0].Hostname != "darkleon" {
+		t.Errorf("hostname = %q after a silent exchange, want it kept", peers[0].Hostname)
+	}
+
+	// Addresses the peer keeps answering on are not disturbed by naming it.
+	if len(peers[0].Addrs) != 1 || peers[0].Addrs[0] != "192.168.86.24:8844" {
+		t.Errorf("addrs = %v, want the address preserved", peers[0].Addrs)
+	}
+}
+
+// A rename is the machine's own answer and must win over the previous one.
+func TestPeerHostnameFollowsARename(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+	for _, name := range []string{"old-name", "new-name"} {
+		if err := db.SavePeerHostname(ctx, "p1", name); err != nil {
+			t.Fatalf("SavePeerHostname(%q): %v", name, err)
+		}
+	}
+	names, err := db.PeerNames(ctx)
+	if err != nil {
+		t.Fatalf("PeerNames: %v", err)
+	}
+	if names["p1"] != "new-name" {
+		t.Errorf("PeerNames[p1] = %q, want %q", names["p1"], "new-name")
+	}
+}

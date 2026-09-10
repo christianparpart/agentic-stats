@@ -1,0 +1,15 @@
+-- What a peer calls itself, as it reported over the sync channel.
+--
+-- Distinct from the hostnames table on purpose. That one answers "what does
+-- DNS say about this address", is keyed by address, and stores an empty string
+-- to remember that an address has no name -- which is the ordinary answer on a
+-- home network with no reverse zone. This answers "what does that machine call
+-- itself", which is the only source that still works when there is no resolver
+-- worth asking, and it cannot be clobbered by the next failed lookup.
+--
+-- Carried on the vector frame rather than the beacon: the beacon's tag covers
+-- a fixed field set under a "beacon-v1" label, so widening it would make this
+-- node's announcements unverifiable to every node still running an older
+-- build. The sync channel is already mutually authenticated, and its messages
+-- are documented as extensible in both directions.
+ALTER TABLE peers ADD COLUMN hostname TEXT;

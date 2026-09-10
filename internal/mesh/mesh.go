@@ -70,6 +70,12 @@ type Config struct {
 	Discovery bool
 	// ExcludeInterfaces keeps beacons off VM bridges and similar.
 	ExcludeInterfaces []string
+	// Hostname is what this node calls itself, announced to peers so they can
+	// label it without a reverse lookup. Empty announces nothing.
+	//
+	// Injected rather than read here: os.Hostname is the environment, and a
+	// test must be able to state what this machine is called.
+	Hostname string
 }
 
 // Mesh is a node's peering subsystem.
@@ -136,7 +142,7 @@ func New(cfg Config) (*Mesh, error) {
 	}
 	nodeID := cfg.Store.OriginID()
 
-	syncer, err := meshsync.New(cfg.Store, log)
+	syncer, err := meshsync.New(cfg.Store, meshsync.Config{Log: log, Host: cfg.Hostname})
 	if err != nil {
 		return nil, err
 	}
@@ -400,6 +406,11 @@ func (m *Mesh) exchange(ctx context.Context, conn *channel.Conn, label string) {
 
 	stats, err := m.syncer.Exchange(ctx, conn, conn.PeerNodeID)
 	m.recordOutcome(conn.PeerNodeID, stats.PeerVector, err)
+	// Before the error check: the name rides on the first frame, so a peer
+	// that announced itself and then failed mid-transfer has still told us
+	// what it is called, and a report about a failing peer is exactly where
+	// its name is most wanted.
+	m.recordPeerHost(conn.PeerNodeID, stats.PeerHost)
 	if err != nil {
 		m.log.Warn("exchange failed", "peer", conn.PeerNodeID, "via", label, "error", err)
 		return
@@ -446,6 +457,21 @@ func (m *Mesh) recordOutcome(peerID string, vector store.VersionVector, cause er
 	defer cancel()
 	if err := m.cfg.Store.RecordConvergence(ctx, peerID, encoded, cause); err != nil {
 		m.log.Debug("record convergence", "peer", peerID, "error", err)
+	}
+}
+
+// recordPeerHost stores the name a peer reported for itself.
+//
+// Its own context for the same reason recordOutcome has one: the exchange
+// context is very often already cancelled by the time we get here.
+func (m *Mesh) recordPeerHost(peerID, host string) {
+	if peerID == "" || host == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := m.cfg.Store.SavePeerHostname(ctx, peerID, host); err != nil {
+		m.log.Debug("record peer hostname", "peer", peerID, "error", err)
 	}
 }
 

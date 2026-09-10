@@ -50,12 +50,23 @@ type message struct {
 	Digests map[string]map[int64]string `json:"digests,omitempty"`
 	// Records is present on kindRecords.
 	Records []wireRecord `json:"records,omitempty"`
+	// Host accompanies the vector: what this node calls itself.
+	//
+	// Sent here rather than in the beacon because the beacon's tag covers a
+	// fixed field set under a "beacon-v1" label, so widening it would make a
+	// new node's announcements unverifiable to every node still on an older
+	// build. This channel is already mutually authenticated, and an added
+	// field is compatible in both directions: an old node ignores it, and a
+	// node that never sends one decodes to the empty string, which is treated
+	// as "said nothing" and never overwrites a name already learned.
+	Host string `json:"host,omitempty"`
 }
 
 // announcement is what a node says about itself at the start of an exchange.
 type announcement struct {
 	vector  store.VersionVector
 	digests map[string]map[int64]string
+	host    string
 }
 
 // wireRecord is a record in transit.
@@ -142,23 +153,38 @@ type Stats struct {
 	// PeerVector is what the peer said it held, recorded so replication lag
 	// can be computed rather than guessed. Nil if the peer never announced.
 	PeerVector store.VersionVector
+	// PeerHost is what the peer calls itself, empty if it did not say --
+	// which is what a node from before this field existed sends.
+	PeerHost string
 }
 
 // Syncer converges a local replica with peers.
 type Syncer struct {
-	db  *store.DB
-	log *slog.Logger
+	db   *store.DB
+	log  *slog.Logger
+	host string
+}
+
+// Config is everything a Syncer needs beyond its store.
+type Config struct {
+	// Log receives exchange detail. Nil discards it.
+	Log *slog.Logger
+	// Host is what this node calls itself, announced to peers so they can
+	// name it without a resolver. Empty announces nothing, which is what a
+	// machine whose hostname cannot be read should do.
+	Host string
 }
 
 // New returns a Syncer over db.
-func New(db *store.DB, log *slog.Logger) (*Syncer, error) {
+func New(db *store.DB, cfg Config) (*Syncer, error) {
 	if db == nil {
 		return nil, errors.New("sync: a store is required")
 	}
+	log := cfg.Log
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &Syncer{db: db, log: log}, nil
+	return &Syncer{db: db, log: log, host: cfg.Host}, nil
 }
 
 // Exchange converges with the peer on the far side of rw.
@@ -185,6 +211,7 @@ func (s *Syncer) Exchange(ctx context.Context, rw io.ReadWriter, peerID string) 
 	go func() {
 		if err := writeFrame(rw, message{
 			Kind: kindVector, Vector: mine.vector, Digests: mine.digests,
+			Host: mine.host,
 		}); err != nil {
 			sendDone <- sendResult{err: fmt.Errorf("sync: send vector: %w", err)}
 			return
@@ -232,7 +259,7 @@ func (s *Syncer) announce(ctx context.Context) (announcement, error) {
 			digests[origin] = d
 		}
 	}
-	return announcement{vector: vec, digests: digests}, nil
+	return announcement{vector: vec, digests: digests, host: s.host}, nil
 }
 
 // resendFrom returns the sequence to send from for one origin, or -1 to send
@@ -357,8 +384,9 @@ func (s *Syncer) receive(ctx context.Context, r io.Reader, peerVector chan<- ann
 			if published {
 				return stats, errors.New("sync: peer sent a second vector")
 			}
-			peerVector <- announcement{vector: msg.Vector, digests: msg.Digests}
+			peerVector <- announcement{vector: msg.Vector, digests: msg.Digests, host: msg.Host}
 			stats.PeerVector = msg.Vector
+			stats.PeerHost = msg.Host
 			published = true
 		case kindDone:
 			return stats, nil

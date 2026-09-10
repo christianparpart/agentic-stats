@@ -80,7 +80,11 @@ func (a Address) String() string {
 
 // PeerHealth is one peer's convergence state.
 type PeerHealth struct {
-	ID       string    `json:"id"`
+	ID string `json:"id"`
+	// Host is what the peer calls itself, empty until it has said so over an
+	// exchange. Preferred over reverse DNS wherever a peer is named, because
+	// it is the machine's own answer and does not depend on a resolver.
+	Host     string    `json:"host,omitempty"`
 	Addrs    []Address `json:"addrs"`
 	Static   bool      `json:"static"`
 	Reach    Reach     `json:"reach"`
@@ -150,6 +154,7 @@ func peerHealth(p store.Peer, mine store.VersionVector,
 ) PeerHealth {
 	h := PeerHealth{
 		ID:            p.ID,
+		Host:          p.Hostname,
 		Addrs:         addresses(p.Addrs, names),
 		Static:        p.Static,
 		LastSeen:      p.LastSeen,

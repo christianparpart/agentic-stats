@@ -425,6 +425,12 @@ type Peer struct {
 	// sync layer's JSON. Opaque here: the store keeps it, derive and the API
 	// interpret it.
 	LastVector string
+	// Hostname is what the peer calls itself, empty until it has said so.
+	//
+	// Self-reported over the authenticated sync channel, not looked up. It is
+	// what names a machine on a network whose resolver knows nothing about it,
+	// which is the ordinary case for a home LAN.
+	Hostname string
 }
 
 // SavePeer records or refreshes a peer.
@@ -489,6 +495,29 @@ func (db *DB) RecordConvergence(ctx context.Context, peerID, vector string, caus
 		peerID, now, converged, lastErr, vec)
 	if err != nil {
 		return fmt.Errorf("store: record convergence: %w", err)
+	}
+	return nil
+}
+
+// SavePeerHostname records the name a peer reports for itself.
+//
+// Only ever called with a name the peer stated over an authenticated channel,
+// and never with an empty one: a peer too old to report a name must not erase
+// the name it gave before it was upgraded.
+func (db *DB) SavePeerHostname(ctx context.Context, peerID, hostname string) error {
+	if peerID == "" {
+		return errors.New("store: peer id is required")
+	}
+	if hostname == "" {
+		return nil
+	}
+	_, err := db.sql.ExecContext(ctx, `
+		INSERT INTO peers (peer_id, addrs, last_seen, static, hostname)
+		VALUES (?, '', ?, 0, ?)
+		ON CONFLICT (peer_id) DO UPDATE SET hostname = excluded.hostname`,
+		peerID, db.now().Format(time.RFC3339Nano), hostname)
+	if err != nil {
+		return fmt.Errorf("store: save peer hostname: %w", err)
 	}
 	return nil
 }
@@ -568,6 +597,12 @@ func (db *DB) PeerNames(ctx context.Context) (map[string]string, error) {
 
 	out := make(map[string]string, len(peers))
 	for _, p := range peers {
+		// What the machine calls itself beats what a resolver was willing to
+		// say about one of its addresses, and is usually the only answer.
+		if p.Hostname != "" {
+			out[p.ID] = p.Hostname
+			continue
+		}
 		for _, addr := range p.Addrs {
 			host := addr
 			if h, _, err := net.SplitHostPort(addr); err == nil {
@@ -587,7 +622,7 @@ func (db *DB) Peers(ctx context.Context) ([]Peer, error) {
 	rows, err := db.sql.QueryContext(ctx, `
 		SELECT peer_id, addrs, coalesce(last_seen, ''), static,
 		       coalesce(last_converged, ''), coalesce(last_error, ''),
-		       coalesce(last_vector, '')
+		       coalesce(last_vector, ''), coalesce(hostname, '')
 		  FROM peers ORDER BY peer_id`)
 	if err != nil {
 		return nil, fmt.Errorf("store: read peers: %w", err)
@@ -600,7 +635,7 @@ func (db *DB) Peers(ctx context.Context) ([]Peer, error) {
 		var addrs string
 		var static int
 		if err := rows.Scan(&p.ID, &addrs, &p.LastSeen, &static,
-			&p.LastConverged, &p.LastError, &p.LastVector); err != nil {
+			&p.LastConverged, &p.LastError, &p.LastVector, &p.Hostname); err != nil {
 			return nil, fmt.Errorf("store: scan peer: %w", err)
 		}
 		if addrs != "" {

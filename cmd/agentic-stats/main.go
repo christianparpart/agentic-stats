@@ -376,6 +376,7 @@ func (n *node) buildMesh(keys *seal.Keys, cfg agentcfg.Config, log *slog.Logger)
 		StaticPeers:       cfg.Mesh.Peers,
 		Discovery:         cfg.Mesh.Discovery,
 		ExcludeInterfaces: cfg.Mesh.ExcludeInterfaces,
+		Hostname:          localHostname(),
 	})
 	if err != nil {
 		return err
@@ -755,7 +756,7 @@ func runStatus(args []string, defaultPath string) error {
 	}
 	fmt.Printf("peers    %d\n", len(health.Peers))
 	for _, p := range health.Peers {
-		fmt.Printf("  %-34s %s\n", p.ID, describeAddrs(p.Addrs))
+		fmt.Printf("  %-34s %s\n", peerLabel(p), describeAddrs(p.Addrs))
 		fmt.Printf("  %-34s %s%s\n", "", p.Reach, convergedAgo(p))
 		if p.Behind > 0 || p.Ahead > 0 {
 			fmt.Printf("  %-34s behind %d, ahead %d as of that exchange\n",
@@ -1063,4 +1064,34 @@ func reportPass(log *slog.Logger, stats collector.Stats, err error) error {
 		"stored", stats.Stored, "duplicates", stats.Duplicates,
 		"restarted", stats.Restarted, "gone", stats.Gone)
 	return nil
+}
+
+// localHostname is what this machine calls itself, for peers to label it by.
+//
+// The short name, not the FQDN: a fleet is a handful of machines someone named
+// themselves, and "darkleon" is what its owner calls it. An unreadable
+// hostname is not an error worth failing a start over -- the node simply
+// announces nothing and peers fall back to reverse DNS, then to the origin id.
+func localHostname() string {
+	name, err := os.Hostname()
+	if err != nil {
+		return ""
+	}
+	if host, _, ok := strings.Cut(name, "."); ok {
+		return host
+	}
+	return name
+}
+
+// peerLabel names a peer for a report.
+//
+// The name the machine reports for itself where there is one, with the origin
+// id kept alongside it: the id is what quarantine and the version vector are
+// keyed by, so a report that replaced it entirely would not be usable for
+// diagnosing the thing it is describing.
+func peerLabel(p mesh.PeerHealth) string {
+	if p.Host == "" {
+		return p.ID
+	}
+	return p.Host + " (" + p.ID[:8] + ")"
 }

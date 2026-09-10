@@ -53,11 +53,11 @@ func fill(t *testing.T, db *store.DB, from, to int) {
 // exchange runs one full sync between two stores over an in-memory pipe.
 func exchange(t *testing.T, a, b *store.DB) (meshsync.Stats, meshsync.Stats) {
 	t.Helper()
-	sa, err := meshsync.New(a, nil)
+	sa, err := meshsync.New(a, meshsync.Config{})
 	if err != nil {
 		t.Fatalf("sync.New: %v", err)
 	}
-	sb, err := meshsync.New(b, nil)
+	sb, err := meshsync.New(b, meshsync.Config{})
 	if err != nil {
 		t.Fatalf("sync.New: %v", err)
 	}
@@ -261,7 +261,82 @@ func TestForkedOriginIsQuarantinedDuringSync(t *testing.T) {
 }
 
 func TestNewRequiresAStore(t *testing.T) {
-	if _, err := meshsync.New(nil, nil); err == nil {
+	if _, err := meshsync.New(nil, meshsync.Config{}); err == nil {
 		t.Error("expected an error when the store is missing")
+	}
+}
+
+// exchangeNamed runs one exchange where each side reports a name for itself.
+func exchangeNamed(t *testing.T, a, b *store.DB, hostA, hostB string) (meshsync.Stats, meshsync.Stats) {
+	t.Helper()
+	sa, err := meshsync.New(a, meshsync.Config{Host: hostA})
+	if err != nil {
+		t.Fatalf("sync.New: %v", err)
+	}
+	sb, err := meshsync.New(b, meshsync.Config{Host: hostB})
+	if err != nil {
+		t.Fatalf("sync.New: %v", err)
+	}
+
+	left, right := net.Pipe()
+	t.Cleanup(func() { _ = left.Close(); _ = right.Close() })
+
+	ctx := context.Background()
+	type result struct {
+		stats meshsync.Stats
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		s, err := sb.Exchange(ctx, right, "a")
+		done <- result{s, err}
+	}()
+	statsA, err := sa.Exchange(ctx, left, "b")
+	if err != nil {
+		t.Fatalf("Exchange from a: %v", err)
+	}
+	res := <-done
+	if res.err != nil {
+		t.Fatalf("Exchange from b: %v", res.err)
+	}
+	return statsA, res.stats
+}
+
+// A machine on a LAN with no reverse zone has no name a resolver will give up,
+// so it says what it is called itself.
+func TestEachSideLearnsWhatThePeerCallsItself(t *testing.T) {
+	a := openStore(t, "a")
+	b := openStore(t, "b")
+	fill(t, a, 0, 3)
+	fill(t, b, 0, 2)
+
+	statsA, statsB := exchangeNamed(t, a, b, "fedora", "darkleon")
+
+	if statsA.PeerHost != "darkleon" {
+		t.Errorf("a learned peer host %q, want %q", statsA.PeerHost, "darkleon")
+	}
+	if statsB.PeerHost != "fedora" {
+		t.Errorf("b learned peer host %q, want %q", statsB.PeerHost, "fedora")
+	}
+}
+
+// A node from before the field existed sends no name. It must still converge,
+// and must not be reported as having announced an empty one -- an empty name
+// would otherwise erase a name learned when that peer was last upgraded.
+func TestAPeerThatReportsNoNameStillConverges(t *testing.T) {
+	a := openStore(t, "a")
+	b := openStore(t, "b")
+	fill(t, a, 0, 4)
+
+	statsA, statsB := exchangeNamed(t, a, b, "fedora", "")
+
+	if statsA.PeerHost != "" {
+		t.Errorf("a learned peer host %q, want empty", statsA.PeerHost)
+	}
+	if statsB.PeerHost != "fedora" {
+		t.Errorf("b learned peer host %q, want %q", statsB.PeerHost, "fedora")
+	}
+	if statsB.Stored != 4 {
+		t.Errorf("b stored %d records, want 4", statsB.Stored)
 	}
 }
