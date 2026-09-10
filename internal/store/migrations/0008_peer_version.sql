@@ -1,0 +1,20 @@
+-- The build a peer reported running, as it said over the sync channel.
+--
+-- Persisted rather than held in memory because the question it answers is
+-- "which machines are behind", and a node that has been switched off for a
+-- week is exactly the one worth knowing about. A vector clock tells us how far
+-- behind a peer's records are; nothing until now said anything about the
+-- software reading them.
+--
+-- Stored as the peer reported it, not as a parsed release. internal/version
+-- declines to rank anything that is not a bare vMAJOR.MINOR.PATCH, and what a
+-- build calls itself is worth keeping even -- especially -- when it is
+-- "dev" or a commit hash: that string is the answer to why a node is not
+-- converging with the rest.
+--
+-- Carried on the vector frame rather than the beacon, for the same reason
+-- hostname is: the beacon's tag covers a fixed field set under a "beacon-v1"
+-- label, so widening it would make this node's announcements unverifiable to
+-- every node still running an older build -- which is precisely the population
+-- a rolling upgrade has to reach.
+ALTER TABLE peers ADD COLUMN version TEXT;
