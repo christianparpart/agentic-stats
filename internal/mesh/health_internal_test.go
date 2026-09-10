@@ -59,7 +59,7 @@ func TestReachClassification(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := peerHealth(tc.peer, store.VersionVector{}, now)
+			got := peerHealth(tc.peer, store.VersionVector{}, nil, now)
 			if got.Reach != tc.want {
 				t.Errorf("reach = %v, want %v", got.Reach, tc.want)
 			}
@@ -75,7 +75,7 @@ func TestFailingOutranksStale(t *testing.T) {
 		LastConverged: ago(3 * StaleAfter),
 		LastError:     "i/o timeout",
 	}
-	if got := peerHealth(p, store.VersionVector{}, now).Reach; got != ReachFailing {
+	if got := peerHealth(p, store.VersionVector{}, nil, now).Reach; got != ReachFailing {
 		t.Errorf("reach = %v, want %v", got, ReachFailing)
 	}
 }
@@ -151,7 +151,7 @@ func TestLagToleratesAMissingOrBrokenVector(t *testing.T) {
 // A clock that has moved must not produce a negative age.
 func TestAFutureConvergenceReadsAsZero(t *testing.T) {
 	p := store.Peer{ID: "p", LastConverged: now.Add(time.Hour).Format(time.RFC3339Nano)}
-	if got := peerHealth(p, store.VersionVector{}, now).SinceConverged; got != 0 {
+	if got := peerHealth(p, store.VersionVector{}, nil, now).SinceConverged; got != 0 {
 		t.Errorf("since converged = %d, want 0", got)
 	}
 }

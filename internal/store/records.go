@@ -485,6 +485,59 @@ func (db *DB) RecordConvergence(ctx context.Context, peerID, vector string, caus
 	return nil
 }
 
+// Hostname is one address's reverse-DNS answer.
+type Hostname struct {
+	// Name is the name the address answers to, empty when it has none.
+	//
+	// Empty is an answer and not a missing one -- the missing case is no row
+	// at all. Keeping the negative is what stops a mesh of unnamed addresses
+	// asking a resolver the same doomed question every sweep.
+	Name string
+	// ResolvedAt is when the lookup was made, as RFC3339Nano.
+	ResolvedAt string
+}
+
+// Hostnames returns every reverse lookup this node has made, keyed by address.
+func (db *DB) Hostnames(ctx context.Context) (map[string]Hostname, error) {
+	rows, err := db.sql.QueryContext(ctx, `SELECT ip, hostname, resolved_at FROM hostnames`)
+	if err != nil {
+		return nil, fmt.Errorf("store: read hostnames: %w", err)
+	}
+	defer func() { _ = rows.Close() }() // rows fully drained below
+
+	out := make(map[string]Hostname)
+	for rows.Next() {
+		var ip string
+		var h Hostname
+		if err := rows.Scan(&ip, &h.Name, &h.ResolvedAt); err != nil {
+			return nil, fmt.Errorf("store: scan hostname: %w", err)
+		}
+		out[ip] = h
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: read hostnames: %w", err)
+	}
+	return out, nil
+}
+
+// SaveHostname records one reverse lookup. An empty name records that the
+// address has none.
+func (db *DB) SaveHostname(ctx context.Context, ip, name string) error {
+	if ip == "" {
+		return errors.New("store: address is required")
+	}
+	_, err := db.sql.ExecContext(ctx, `
+		INSERT INTO hostnames (ip, hostname, resolved_at) VALUES (?, ?, ?)
+		ON CONFLICT (ip) DO UPDATE SET
+			hostname    = excluded.hostname,
+			resolved_at = excluded.resolved_at`,
+		ip, name, db.now().Format(time.RFC3339Nano))
+	if err != nil {
+		return fmt.Errorf("store: save hostname: %w", err)
+	}
+	return nil
+}
+
 // Peers returns every peer this node knows about.
 func (db *DB) Peers(ctx context.Context) ([]Peer, error) {
 	rows, err := db.sql.QueryContext(ctx, `

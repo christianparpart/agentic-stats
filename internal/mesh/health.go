@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"time"
 
 	"github.com/christianparpart/agentic-stats/internal/store"
@@ -55,13 +56,35 @@ func (r Reach) String() string {
 // survives a reordering of the constants.
 func (r Reach) MarshalJSON() ([]byte, error) { return json.Marshal(r.String()) }
 
+// Address is one way to reach a peer, with the name it answers to.
+//
+// A pair rather than two parallel lists, so an address can never be shown
+// under the wrong name.
+type Address struct {
+	Addr string `json:"addr"`
+	// Name is the reverse-DNS name, empty when the address has none or none
+	// has been looked up yet.
+	//
+	// Never resolved while a report is being rendered: see internal/hostnames
+	// for why an archive report must not wait on DNS.
+	Name string `json:"name,omitempty"`
+}
+
+// String renders the name with the address behind it, or just the address.
+func (a Address) String() string {
+	if a.Name == "" {
+		return a.Addr
+	}
+	return a.Name + " (" + a.Addr + ")"
+}
+
 // PeerHealth is one peer's convergence state.
 type PeerHealth struct {
-	ID       string   `json:"id"`
-	Addrs    []string `json:"addrs"`
-	Static   bool     `json:"static"`
-	Reach    Reach    `json:"reach"`
-	LastSeen string   `json:"last_seen,omitempty"`
+	ID       string    `json:"id"`
+	Addrs    []Address `json:"addrs"`
+	Static   bool      `json:"static"`
+	Reach    Reach     `json:"reach"`
+	LastSeen string    `json:"last_seen,omitempty"`
 	// LastConverged is when data last actually moved, empty if it never has.
 	LastConverged string `json:"last_converged,omitempty"`
 	// SinceConverged is that gap in seconds, for a reader that would rather
@@ -106,27 +129,32 @@ func (m *Mesh) Health(ctx context.Context) (Health, error) {
 	if err != nil {
 		return Health{}, fmt.Errorf("mesh: count quarantined: %w", err)
 	}
+	// Read, never resolved. The daemon looks these up in the background
+	// precisely so that this call cannot wait on a resolver.
+	names, err := m.cfg.Store.Hostnames(ctx)
+	if err != nil {
+		return Health{}, fmt.Errorf("mesh: read hostnames: %w", err)
+	}
 
 	now := time.Now().UTC()
 	out := Health{NodeID: m.nodeID, Peers: make([]PeerHealth, 0, len(peers)), Quarantined: quarantined}
 	for _, p := range peers {
-		out.Peers = append(out.Peers, peerHealth(p, mine, now))
+		out.Peers = append(out.Peers, peerHealth(p, mine, names, now))
 	}
 	return out, nil
 }
 
 // peerHealth classifies one peer.
-func peerHealth(p store.Peer, mine store.VersionVector, now time.Time) PeerHealth {
+func peerHealth(p store.Peer, mine store.VersionVector,
+	names map[string]store.Hostname, now time.Time,
+) PeerHealth {
 	h := PeerHealth{
 		ID:            p.ID,
-		Addrs:         p.Addrs,
+		Addrs:         addresses(p.Addrs, names),
 		Static:        p.Static,
 		LastSeen:      p.LastSeen,
 		LastConverged: p.LastConverged,
 		LastError:     p.LastError,
-	}
-	if h.Addrs == nil {
-		h.Addrs = []string{}
 	}
 
 	switch {
@@ -157,6 +185,24 @@ func peerHealth(p store.Peer, mine store.VersionVector, now time.Time) PeerHealt
 
 	h.Behind, h.Ahead = lag(mine, p.LastVector)
 	return h
+}
+
+// addresses pairs each address with whatever name is on record for it.
+//
+// Always a list, never nil: an absent field and an empty one mean the same
+// thing to a reader and different things to a JSON parser.
+func addresses(addrs []string, names map[string]store.Hostname) []Address {
+	out := make([]Address, 0, len(addrs))
+	for _, addr := range addrs {
+		a := Address{Addr: addr}
+		host := addr
+		if h, _, err := net.SplitHostPort(addr); err == nil {
+			host = h
+		}
+		a.Name = names[host].Name
+		out = append(out, a)
+	}
+	return out
 }
 
 // lag compares what we hold against what the peer last said it held.

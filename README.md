@@ -155,6 +155,13 @@ curl .../v1/health                 # the same, as JSON, with an overall ok/degra
 curl .../healthz                   # liveness only, and deliberately uninformative
 ```
 
+Peers are listed by name where they have one — `macbookpro.lan (192.168.86.25:8844)`
+— because an address alone rarely says which machine is missing. The daemon looks
+those up in the background and writes them into the archive; `status` reads what is
+written and never asks a resolver. A report about whether replication is working
+must not be able to hang on DNS, which is at its least reliable on exactly the
+machine whose network you are investigating.
+
 `/v1/health` needs the mesh key, because peer identities, addresses and lag amount
 to a map of your fleet. `/healthz` does not, which is why it says nothing else.
 

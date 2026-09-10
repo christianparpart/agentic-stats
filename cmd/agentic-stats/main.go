@@ -33,6 +33,7 @@ import (
 	"github.com/christianparpart/agentic-stats/internal/cursor"
 	"github.com/christianparpart/agentic-stats/internal/daemonlog"
 	"github.com/christianparpart/agentic-stats/internal/derive"
+	"github.com/christianparpart/agentic-stats/internal/hostnames"
 	"github.com/christianparpart/agentic-stats/internal/ingest"
 	"github.com/christianparpart/agentic-stats/internal/mesh"
 	"github.com/christianparpart/agentic-stats/internal/pricing"
@@ -487,6 +488,13 @@ func runNode(args []string, defaultPath string, m mode) error {
 			resume.Watch(ctx, resume.Config{Logger: log}, n.mesh.Wake)
 			return nil
 		}})
+		// Peers are named here, in the background, so that nothing which
+		// reports on them ever has to wait for a resolver.
+		names, err := hostnames.New(hostnames.Config{Store: n.db, Logger: log})
+		if err != nil {
+			return supervise.Permanent(err)
+		}
+		subsystems = append(subsystems, supervise.Config{Name: "hostnames", Run: names.Run})
 	}
 	if n.bridge != nil {
 		subsystems = append(subsystems, supervise.Config{Name: "bridge", Run: func(ctx context.Context) error {
@@ -665,7 +673,7 @@ func runStatus(args []string, defaultPath string) error {
 	}
 	fmt.Printf("peers    %d\n", len(health.Peers))
 	for _, p := range health.Peers {
-		fmt.Printf("  %-34s %v\n", p.ID, p.Addrs)
+		fmt.Printf("  %-34s %s\n", p.ID, describeAddrs(p.Addrs))
 		fmt.Printf("  %-34s %s%s\n", "", p.Reach, convergedAgo(p))
 		if p.Behind > 0 || p.Ahead > 0 {
 			fmt.Printf("  %-34s behind %d, ahead %d as of that exchange\n",
@@ -689,6 +697,23 @@ func runStatus(args []string, defaultPath string) error {
 		fmt.Println("cloned VM or a copied database. Their data is being kept, not merged.")
 	}
 	return nil
+}
+
+// describeAddrs renders a peer's addresses on one line.
+//
+// Names come from the archive, where the daemon wrote them; `status` performs
+// no lookup of its own. A report about whether the archive is replicating must
+// not be able to hang on DNS, which is at its least reliable on exactly the
+// machine whose network someone is investigating.
+func describeAddrs(addrs []mesh.Address) string {
+	if len(addrs) == 0 {
+		return "(no address)"
+	}
+	parts := make([]string, 0, len(addrs))
+	for _, a := range addrs {
+		parts = append(parts, a.String())
+	}
+	return strings.Join(parts, ", ")
 }
 
 // serviceSummary describes the autostart entry in one line, for `status`.
