@@ -77,8 +77,33 @@ type Mesh struct {
 	dialer *channel.Dialer
 	nodeID string
 
+	// wake asks the dial loop to sweep now. Buffered by one: several wake-ups
+	// arriving together mean the same thing as one.
+	wake chan struct{}
+
 	mu      sync.Mutex
 	backoff map[string]time.Time
+}
+
+// Wake retries every peer immediately, discarding any backoff.
+//
+// Called when the machine has just resumed. Everything the backoff table
+// records was learned before the interruption and none of it is trustworthy
+// now: an address that was refusing connections may be up, and the machine may
+// have moved to a different network entirely, where the failures it remembers
+// were about somewhere else. Waiting out a fifteen-minute backoff to discover
+// that is exactly the wrong behaviour on the machine that has been away longest.
+//
+// Safe to call from any goroutine, and cheap enough to call spuriously.
+func (m *Mesh) Wake() {
+	m.mu.Lock()
+	clear(m.backoff)
+	m.mu.Unlock()
+
+	select {
+	case m.wake <- struct{}{}:
+	default: // a sweep is already pending; one is enough
+	}
 }
 
 // New returns a Mesh over the given store.
@@ -105,7 +130,9 @@ func New(cfg Config) (*Mesh, error) {
 	}
 	return &Mesh{
 		cfg: cfg, log: log, syncer: syncer, dialer: dialer,
-		nodeID: nodeID, backoff: make(map[string]time.Time),
+		nodeID:  nodeID,
+		backoff: make(map[string]time.Time),
+		wake:    make(chan struct{}, 1),
 	}, nil
 }
 
@@ -259,6 +286,9 @@ func (m *Mesh) dialLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case <-m.wake:
+			// A resume, or anything else that invalidated what we believed
+			// about the network. Sweep now rather than at the next tick.
 		case <-ticker.C:
 		}
 	}

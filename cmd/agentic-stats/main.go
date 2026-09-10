@@ -33,6 +33,7 @@ import (
 	"github.com/christianparpart/agentic-stats/internal/ingest"
 	"github.com/christianparpart/agentic-stats/internal/mesh"
 	"github.com/christianparpart/agentic-stats/internal/pricing"
+	"github.com/christianparpart/agentic-stats/internal/resume"
 	"github.com/christianparpart/agentic-stats/internal/seal"
 	"github.com/christianparpart/agentic-stats/internal/service"
 	"github.com/christianparpart/agentic-stats/internal/source"
@@ -438,6 +439,14 @@ func runNode(args []string, defaultPath string, m mode) error {
 	}
 	if n.mesh != nil {
 		subsystems = append(subsystems, supervise.Config{Name: "peering", Run: n.mesh.Run})
+		// Sleeping and being suspended are the normal state of a laptop and a
+		// VM. Without this the node waits out an ordinary dial interval, and
+		// possibly a fifteen-minute backoff learned on a network it is no
+		// longer attached to, before it tries anyone again.
+		subsystems = append(subsystems, supervise.Config{Name: "resume-watch", Run: func(ctx context.Context) error {
+			resume.Watch(ctx, resume.Config{Logger: log}, n.mesh.Wake)
+			return nil
+		}})
 	}
 	if n.bridge != nil {
 		subsystems = append(subsystems, supervise.Config{Name: "bridge", Run: func(ctx context.Context) error {
