@@ -1,0 +1,21 @@
+# Source files are LF in the working tree on every platform.
+#
+# Without this, a Windows clone with the common core.autocrlf=true setting gets
+# CRLF on disk, and `gofmt -l` then reports every Go file in the repository as
+# unformatted -- so `make check`, which AGENT.md requires before every commit,
+# cannot pass there at all. The agent ships on Windows, so a contributor on
+# Windows must be able to run the same checks as CI.
+*.go      text eol=lf
+*.sql     text eol=lf
+*.toml    text eol=lf
+*.md      text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.sh      text eol=lf
+*.html    text eol=lf
+*.json    text eol=lf
+.githooks/* text eol=lf
+
+# Transcript fixtures are compared byte for byte; a line-ending rewrite would
+# change the content hashes the parser tests are pinned to.
+*.jsonl   -text

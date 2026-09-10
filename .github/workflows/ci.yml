@@ -42,9 +42,20 @@ jobs:
         with:
           version: v2.13.2
 
+  # The suite runs on every operating system the fleet uses, not just the one
+  # that is cheapest to run. Building for windows and darwin without ever
+  # executing a test there let three faults live indefinitely: exclude_paths
+  # silently matched nothing on Windows, the file holding the mesh key was left
+  # readable, and two nodes on one Windows host could not discover each other.
+  # All three were invisible to a Linux-only run and obvious the moment one
+  # happened on Windows.
   test:
-    name: Test
-    runs-on: ubuntu-latest
+    name: Test ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -55,14 +66,26 @@ jobs:
       # No database service: the archive is embedded SQLite, so the whole
       # suite runs anywhere. Its predecessor silently skipped every
       # integration test when no PostgreSQL was reachable.
+      #
+      # The race detector runs on Linux only. It needs cgo and therefore a C
+      # compiler, which is dependable on the ubuntu runner and less so on the
+      # others; the concurrency being checked is not platform-specific, so one
+      # thorough run beats three flaky ones.
       - name: Test
-        run: go test -race -coverpkg=./... -coverprofile=coverage.out ./...
+        if: matrix.os != 'ubuntu-latest'
+        run: go test -count=1 ./...
+
+      - name: Test with the race detector
+        if: matrix.os == 'ubuntu-latest'
+        run: go test -race -count=1 -coverpkg=./... -coverprofile=coverage.out ./...
 
       - name: Coverage summary
+        if: matrix.os == 'ubuntu-latest'
         run: go tool cover -func=coverage.out | tail -1
 
       # Nothing in this suite may quietly skip itself.
       - name: Assert no test skipped
+        if: matrix.os == 'ubuntu-latest'
         run: |
           output="$(go test -count=1 -v ./internal/integration/... 2>&1)"
           echo "$output" | tail -20
