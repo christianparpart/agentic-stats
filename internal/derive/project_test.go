@@ -57,7 +57,7 @@ func TestProjectNamesAreFrozen(t *testing.T) {
 		{"a UNC share", `\\build01\repos\fastcached`, "fastcached"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := rules(t).of(tc.cwd); got != tc.want {
+			if got := rules(t).of(tc.cwd, nil); got != tc.want {
 				t.Errorf("of(%q) = %q, want %q", tc.cwd, got, tc.want)
 			}
 		})
@@ -70,7 +70,7 @@ func TestProjectNamesAreFrozen(t *testing.T) {
 // its own test.
 func TestAKeywordIsNeverItselfAProject(t *testing.T) {
 	for _, cwd := range []string{`D:\issue-124`, "/home/chris/pr-120", `D:\wt-139`} {
-		if got := rules(t).of(cwd); got == "issue" || got == "pr" || got == "wt" {
+		if got := rules(t).of(cwd, nil); got == "issue" || got == "pr" || got == "wt" {
 			t.Errorf("of(%q) = %q; a suffix keyword is a category, not a project", cwd, got)
 		}
 	}
@@ -86,7 +86,7 @@ func TestProjectNamesAreIndependentOfPathSeparator(t *testing.T) {
 		{`D:\fastcached\.claude\worktrees\issue-124`, "D:/fastcached/.claude/worktrees/issue-124"},
 		{`home\chris\endo`, "home/chris/endo"},
 	} {
-		w, p := r.of(tc.windows), r.of(tc.posix)
+		w, p := r.of(tc.windows, nil), r.of(tc.posix, nil)
 		if w != p {
 			t.Errorf("of(%q) = %q but of(%q) = %q", tc.windows, w, tc.posix, p)
 		}
@@ -99,10 +99,10 @@ func TestProjectNamesAreIndependentOfPathSeparator(t *testing.T) {
 // that has received half the mesh disagree with one that has received all of it.
 func TestProjectFoldingDoesNotDependOnWhatElseTheArchiveHolds(t *testing.T) {
 	r := rules(t)
-	alone := r.of(`D:\fastcached-wt-139`)
+	alone := r.of(`D:\fastcached-wt-139`, nil)
 	for _, other := range []string{`D:\fastcached`, `D:\fastcached-wt`, `D:\endo`, ""} {
-		_ = r.of(other)
-		if got := r.of(`D:\fastcached-wt-139`); got != alone {
+		_ = r.of(other, nil)
+		if got := r.of(`D:\fastcached-wt-139`, nil); got != alone {
 			t.Fatalf("after seeing %q the answer changed to %q, was %q", other, got, alone)
 		}
 	}
@@ -119,8 +119,8 @@ func TestFoldingIsAFixedPoint(t *testing.T) {
 		`D:\fastcached`, `D:\fastcached-wt-139`, `D:\fastcached-issue-59-69`,
 		`D:\fastcached\.claude\worktrees\issue-124`, `D:\claude-marketplace`,
 	} {
-		once := r.of(cwd)
-		if twice := r.of(once); twice != once {
+		once := r.of(cwd, nil)
+		if twice := r.of(once, nil); twice != once {
 			t.Errorf("of(%q) = %q, but folding that again gives %q", cwd, once, twice)
 		}
 	}
@@ -141,10 +141,10 @@ func TestSuppliedPatternsReplaceTheDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newProjectRules: %v", err)
 	}
-	if got := r.of(`D:\fastcached-issue-154`); got != "fastcached-issue-154" {
+	if got := r.of(`D:\fastcached-issue-154`, nil); got != "fastcached-issue-154" {
 		t.Errorf("of(issue sibling) = %q; the default patterns should be gone", got)
 	}
-	if got := r.of(`D:\fastcached-only-this`); got != "fastcached" {
+	if got := r.of(`D:\fastcached-only-this`, nil); got != "fastcached" {
 		t.Errorf("of(supplied pattern) = %q, want fastcached", got)
 	}
 }
@@ -154,5 +154,153 @@ func TestPathSegmentsDropsWhatIsNotAName(t *testing.T) {
 	want := []string{"D:", "fastcached", "internal"}
 	if !slices.Equal(got, want) {
 		t.Errorf("pathSegments = %v, want %v", got, want)
+	}
+}
+
+// A pull request is evidence, not a hint: the assistant recorded the repository
+// it opened one against, so a directory whose sessions shipped there is a
+// checkout of it whatever the directory is called. This is what no naming rule
+// can establish, and every case below is drawn from a real archive.
+func TestADirectoryFoldsOntoTheRepositoryItShippedTo(t *testing.T) {
+	const fastcached = "LASTRADA-Software/fastcached"
+	for _, tc := range []struct {
+		name, cwd string
+		shipped   []string
+		want      string
+	}{
+		{
+			// The case a naming rule cannot reach: a worktree with no issue
+			// number and no marker, indistinguishable by name from a project of
+			// its own.
+			name:    "a descriptively named worktree",
+			cwd:     `D:\fastcached-distributed-compilation`,
+			shipped: []string{fastcached},
+			want:    "fastcached",
+		},
+		{
+			// cwd is not always a repository root, which is the other half of
+			// what this fixes: a build tree would otherwise become a project.
+			name:    "a build directory inside the repository",
+			cwd:     `D:\fastcached\out\build\cl-release`,
+			shipped: []string{fastcached},
+			want:    "fastcached",
+		},
+		{
+			name:    "a directory several levels down",
+			cwd:     `D:\endo\build\clangcl-release\_CPack_Packages\win64\WIX`,
+			shipped: []string{"contour-terminal/endo"},
+			want:    "endo",
+		},
+		{
+			name:    "a plugin directory inside its marketplace",
+			cwd:     `D:\claude-marketplace\plugins\contour-workflows\lib`,
+			shipped: []string{"contour-terminal/claude-marketplace"},
+			want:    "claude-marketplace",
+		},
+		{
+			// A forge that nests groups: this is one repository called
+			// lastrada, not one called developer/lastrada.
+			name:    "a nested group path",
+			cwd:     `D:\Lastrada`,
+			shipped: []string{"jpsc/developer/lastrada"},
+			want:    "Lastrada",
+		},
+		{
+			name:    "the repository root itself is unchanged",
+			cwd:     `D:\fastcached`,
+			shipped: []string{fastcached},
+			want:    "fastcached",
+		},
+		{
+			// Working in one repository and opening a pull request against
+			// another is ordinary. The first must not be re-labelled.
+			name:    "a pull request to somewhere the path never mentions",
+			cwd:     `D:\Domestique`,
+			shipped: []string{fastcached},
+			want:    "Domestique",
+		},
+		{
+			// Several answers is no answer. Falls through to the name rules,
+			// which get this one right anyway.
+			name:    "sessions that shipped to several repositories",
+			cwd:     `D:\fastcached`,
+			shipped: []string{fastcached, "contour-terminal/contour", "LASTRADA-Software/morph"},
+			want:    "fastcached",
+		},
+		{
+			// Several repositories, but only one of them is named by the path,
+			// so the path settles it and the fold is unambiguous.
+			name:    "only one of several repositories is on the path",
+			cwd:     `D:\scratch\shared-checkout`,
+			shipped: []string{"a/shared", "b/checkout"},
+			want:    "shared",
+		},
+		{
+			// Two repositories that the path names equally well. There is no
+			// answer, so the fold declines and the name rules take over.
+			name:    "two repositories the path names equally",
+			cwd:     `D:\shared\checkout`,
+			shipped: []string{"a/shared", "b/checkout"},
+			want:    "checkout",
+		},
+		{
+			name:    "no pull request at all falls back to the name rules",
+			cwd:     `D:\fastcached-issue-154`,
+			shipped: nil,
+			want:    "fastcached",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := rules(t).of(tc.cwd, tc.shipped); got != tc.want {
+				t.Errorf("of(%q, %v) = %q, want %q", tc.cwd, tc.shipped, got, tc.want)
+			}
+		})
+	}
+}
+
+// The guard that makes the rule safe to apply at all: it may shorten a path to
+// something the path already says, and never rename it to something else. A
+// regression here would silently move a project's cost under another project's
+// name, which reads as plausible and is wrong.
+func TestTheShippedFoldOnlyEverShortensThePath(t *testing.T) {
+	r := rules(t)
+	for _, cwd := range []string{
+		`D:\Domestique`, `D:\contour-terminal`, `D:\agentic-stats`,
+		`D:\some\deep\unrelated\place`,
+	} {
+		plain := r.of(cwd, nil)
+		withEvidence := r.of(cwd, []string{"owner/fastcached", "owner/entirely-elsewhere"})
+		if withEvidence != plain {
+			t.Errorf("of(%q) became %q on evidence naming neither; it was %q",
+				cwd, withEvidence, plain)
+		}
+	}
+}
+
+// The order repositories arrive in must not decide the answer, or two replicas
+// holding the same records could label the same directory differently.
+func TestTheShippedFoldDoesNotDependOnRepositoryOrder(t *testing.T) {
+	r := rules(t)
+	cwd := `D:\fastcached\out\build\cl-release`
+	forward := r.of(cwd, []string{"a/fastcached", "b/other", "c/another"})
+	reverse := r.of(cwd, []string{"c/another", "b/other", "a/fastcached"})
+	if forward != reverse {
+		t.Errorf("order changed the answer: %q against %q", forward, reverse)
+	}
+	if forward != "fastcached" {
+		t.Errorf("of = %q, want fastcached", forward)
+	}
+}
+
+func TestRepoNameDropsEveryQualifier(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"owner/repo", "repo"},
+		{"group/subgroup/repo", "repo"},
+		{"repo", "repo"},
+		{"", ""},
+	} {
+		if got := repoName(tc.in); got != tc.want {
+			t.Errorf("repoName(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }
