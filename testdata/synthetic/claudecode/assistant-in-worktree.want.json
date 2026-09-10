@@ -1,0 +1,19 @@
+{
+  "SessionID": "sess-0002",
+  "LineUUID": "uuid-0006",
+  "CapturedAt": "2026-01-03T10:00:00.000Z",
+  "RequestID": "req-0003",
+  "Model": "claude-sonnet-5",
+  "PRRepo": "",
+  "PRNumber": 0,
+  "CWD": "D:\\example-project\\.claude\\worktrees\\agent-a0000000000000001",
+  "GitBranch": "claude/something-123",
+  "Usage": {
+    "Input": 7,
+    "Output": 8,
+    "Thinking": 0,
+    "CacheRead": 0,
+    "CacheWrite5m": 0,
+    "CacheWrite1h": 0
+  }
+}

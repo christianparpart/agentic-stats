@@ -1,0 +1,19 @@
+{
+  "SessionID": "sess-0001",
+  "LineUUID": "uuid-0001",
+  "CapturedAt": "2026-01-02T03:04:05.000Z",
+  "RequestID": "req-0001",
+  "Model": "claude-opus-5",
+  "PRRepo": "",
+  "PRNumber": 0,
+  "CWD": "D:\\example-project",
+  "GitBranch": "master",
+  "Usage": {
+    "Input": 11,
+    "Output": 22,
+    "Thinking": 44,
+    "CacheRead": 33,
+    "CacheWrite5m": 55,
+    "CacheWrite1h": 66
+  }
+}
