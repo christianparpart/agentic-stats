@@ -61,6 +61,44 @@ func (s systemd) Install(cfg Config) (Status, error) {
 	return s.Status()
 }
 
+// Start runs the installed unit.
+func (s systemd) Start() error {
+	if err := s.installed(); err != nil {
+		return err
+	}
+	if err := run("systemctl", "--user", "start", Name+".service"); err != nil {
+		return fmt.Errorf("service: start unit: %w", err)
+	}
+	return nil
+}
+
+// Stop halts the unit, leaving it enabled so it still starts at the next login.
+func (s systemd) Stop() error {
+	if err := s.installed(); err != nil {
+		return err
+	}
+	// systemctl stop on an inactive unit succeeds, which is the right shape:
+	// the caller asked for it to be stopped, and it is.
+	if err := run("systemctl", "--user", "stop", Name+".service"); err != nil {
+		return fmt.Errorf("service: stop unit: %w", err)
+	}
+	return nil
+}
+
+// installed reports whether a unit file is present.
+func (s systemd) installed() error {
+	path, err := s.unitPath()
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return ErrNotInstalled
+	} else if err != nil {
+		return fmt.Errorf("service: stat %s: %w", path, err)
+	}
+	return nil
+}
+
 func (s systemd) Uninstall() error {
 	path, err := s.unitPath()
 	if err != nil {

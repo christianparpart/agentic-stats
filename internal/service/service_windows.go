@@ -55,6 +55,9 @@ func (s scheduler) Install(cfg Config) (Status, error) {
 		// The elevated child ran the whole install, including starting it.
 		return s.Status()
 	}
+	// While we still have the rights this needed elevation for.
+	registerEventSource(cfg)
+
 	if err := run("schtasks", "/Run", "/TN", taskName); err != nil {
 		// The task exists and will start at the next logon even if starting
 		// it now failed.
@@ -63,10 +66,38 @@ func (s scheduler) Install(cfg Config) (Status, error) {
 	return s.Status()
 }
 
+// Start runs the installed task.
+//
+// Unlike creating it, running, ending and querying an existing task need no
+// administrator rights -- the restriction is on writing the Task Scheduler root
+// folder, not on operating what is already in it. So start, stop and restart
+// never prompt.
+func (s scheduler) Start() error {
+	if _, found := queryTask(); found == taskAbsent {
+		return ErrNotInstalled
+	}
+	if err := run("schtasks", "/Run", "/TN", taskName); err != nil {
+		return fmt.Errorf("service: start scheduled task: %w", err)
+	}
+	return nil
+}
+
+// Stop ends the running instance, leaving the task registered.
+func (s scheduler) Stop() error {
+	if _, found := queryTask(); found == taskAbsent {
+		return ErrNotInstalled
+	}
+	// schtasks /End exits non-zero when nothing was running, which is the
+	// state the caller asked for rather than a failure to reach it.
+	_ = run("schtasks", "/End", "/TN", taskName)
+	return nil
+}
+
 func (s scheduler) Uninstall() error {
 	// Deleting a task that is not there is not a failure worth reporting.
 	_ = run("schtasks", "/End", "/TN", taskName)
 	_ = run("schtasks", "/Delete", "/F", "/TN", taskName)
+	unregisterEventSource()
 	return nil
 }
 

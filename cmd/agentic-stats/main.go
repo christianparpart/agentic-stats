@@ -11,6 +11,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -30,6 +31,7 @@ import (
 	"github.com/christianparpart/agentic-stats/internal/certs"
 	"github.com/christianparpart/agentic-stats/internal/collector"
 	"github.com/christianparpart/agentic-stats/internal/cursor"
+	"github.com/christianparpart/agentic-stats/internal/daemonlog"
 	"github.com/christianparpart/agentic-stats/internal/derive"
 	"github.com/christianparpart/agentic-stats/internal/ingest"
 	"github.com/christianparpart/agentic-stats/internal/mesh"
@@ -58,12 +60,20 @@ Usage:
   agentic-stats install    Start automatically when you log in
   agentic-stats uninstall  Remove the autostart entry
   agentic-stats service    Report whether the autostart entry is running
+  agentic-stats start      Start the installed service
+  agentic-stats stop       Stop it, leaving it installed
+  agentic-stats restart    Stop it and start it again
 
 Configuration lives in %s.
 The mesh key may also be supplied as $AGENTIC_STATS_PSK.
 `
 
 func main() {
+	// Windows links this for the GUI subsystem so the service runs without a
+	// console window; this gives the command line its output back. A no-op
+	// everywhere else.
+	attachConsole()
+
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "agentic-stats: %v\n", err)
 		os.Exit(1)
@@ -96,6 +106,12 @@ func run(args []string) error {
 		return runUninstall(args[1:])
 	case "service":
 		return runServiceStatus(args[1:])
+	case "start":
+		return runServiceControl(args[1:], serviceStart)
+	case "stop":
+		return runServiceControl(args[1:], serviceStop)
+	case "restart":
+		return runServiceControl(args[1:], serviceRestart)
 	case "-h", "--help", "help":
 		fmt.Printf(usage, version, defaultPath)
 		return nil
@@ -388,7 +404,30 @@ func runNode(args []string, defaultPath string, m mode) error {
 		return err
 	}
 
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// A daemon started at login has no terminal to write to, so its log has to
+	// go somewhere durable whether or not anyone is watching. In a terminal it
+	// also keeps printing, because a log that vanishes when you run the thing
+	// by hand is the wrong kind of quiet.
+	console := os.Stderr
+	if !hasConsole() {
+		console = nil
+	}
+	logDir, err := logDirectory(*configPath)
+	if err != nil {
+		return err
+	}
+	logger, err := daemonlog.New(daemonlog.Config{
+		Dir:      logDir,
+		Level:    slog.LevelInfo,
+		Console:  consoleWriter(console),
+		EventLog: openEventLog(console != nil),
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = logger.Close() }() // released with the daemon
+	log := logger.Logger
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -747,6 +786,96 @@ func runInstall(args []string, defaultPath string) error {
 	fmt.Printf("\nIt will start automatically when you log in.\n")
 	fmt.Printf("Dashboard: http://%s\n", cfg.Dashboard.Listen)
 	return nil
+}
+
+// logDirectory is where the daemon's log file lives.
+//
+// Beside the archive rather than in a platform log directory, so that the three
+// things belonging to one node -- configuration, archive and log -- are found
+// together, and so that pointing --config elsewhere moves all three.
+func logDirectory(configPath string) (string, error) {
+	if configPath == "" {
+		return "", errors.New("no configuration path to derive a log directory from")
+	}
+	return filepath.Join(filepath.Dir(configPath), "logs"), nil
+}
+
+// consoleWriter adapts a possibly-nil file to the io.Writer the logger wants.
+//
+// A typed nil *os.File in an io.Writer is not a nil interface, and the logger
+// would then write to it and fail on every line.
+func consoleWriter(f *os.File) io.Writer {
+	if f == nil {
+		return nil
+	}
+	return f
+}
+
+// serviceAction is one of the lifecycle verbs.
+//
+// A named type rather than two booleans or a bare string: these are three
+// values of one thing, and the zero value being "start" would make an
+// uninitialised action silently do something.
+type serviceAction uint8
+
+const (
+	// serviceUnset is the zero value and is never a valid request.
+	serviceUnset serviceAction = iota
+	serviceStart
+	serviceStop
+	serviceRestart
+)
+
+// runServiceControl starts, stops or restarts the installed service.
+//
+// None of these needs elevation on any platform: the administrator rights
+// Windows wants are for writing the Task Scheduler root folder when the task is
+// created, not for operating a task that is already there.
+func runServiceControl(args []string, action serviceAction) error {
+	fs := flag.NewFlagSet("service control", flag.ExitOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	mgr, err := service.New()
+	if err != nil {
+		return err
+	}
+
+	var verb string
+	switch action {
+	case serviceStart:
+		verb, err = "started", mgr.Start()
+	case serviceStop:
+		verb, err = "stopped", mgr.Stop()
+	case serviceRestart:
+		verb, err = "restarted", service.Restart(mgr)
+	case serviceUnset:
+		return errors.New("no service action given")
+	default:
+		return fmt.Errorf("unknown service action %d", action)
+	}
+	if err != nil {
+		if errors.Is(err, service.ErrNotInstalled) {
+			return errors.New("no service is installed; run `agentic-stats install` first")
+		}
+		return err
+	}
+
+	fmt.Println(describe(mgr, verb))
+	return nil
+}
+
+// describe renders what the service is doing after an action.
+//
+// Returns a string rather than an error, because the action has already
+// succeeded by this point: failing to *describe* the result afterwards is not a
+// reason to report the action as failed.
+func describe(mgr service.Manager, verb string) string {
+	st, err := mgr.Status()
+	if err != nil {
+		return verb
+	}
+	return verb + ": " + st.Detail
 }
 
 // runUninstall removes the autostart entry.

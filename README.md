@@ -85,6 +85,33 @@ stops the moment you log out — exactly wrong on a headless VM. If that fails i
 along with the command to fix it, rather than leaving you with a collector that only runs
 while you are connected.
 
+Once installed, the service is controlled without any further prompting:
+
+```sh
+agentic-stats start      # start it
+agentic-stats stop       # stop it, leaving it installed
+agentic-stats restart    # both
+agentic-stats service    # is it installed, is it running
+```
+
+## Where a background node logs
+
+A service started at login has no terminal, so its log goes to a file beside the archive
+and configuration — `logs/agentic-stats.log`, rotated at 8 MB, three kept. Run the daemon
+in a terminal and it prints there as well, because a log that vanishes when you run the
+thing by hand is the wrong kind of quiet.
+
+On Windows the service additionally writes to the Application event log, under the source
+`agentic-stats`, registered by `install` while it is already elevated. **Only warnings and
+errors go there.** Event Viewer is where someone looks to find out whether anything is
+wrong, and a "pass complete" every poll interval would bury the entries that matter; the
+full detail is in the file.
+
+The Windows binary is linked for the GUI subsystem so the service runs without a console
+window appearing at every login. The command line still prints normally — it reattaches to
+whatever console launched it — with one visible consequence: a shell does not wait for a
+GUI-subsystem program, so output can arrive just after your prompt returns.
+
 Nodes on the same network find each other automatically. For machines separated by a
 WireGuard or Tailscale tunnel, list them under `mesh.peers` -- multicast cannot cross a
 point-to-point link, so discovery genuinely cannot reach them. For machines that never share

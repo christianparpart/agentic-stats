@@ -78,7 +78,29 @@ type Manager interface {
 	Uninstall() error
 	// Status reports what the platform knows.
 	Status() (Status, error)
+
+	// Start runs an installed service. Starting one already running is not an
+	// error: the caller asked for it to be running, and it is.
+	Start() error
+	// Stop halts a running service, leaving it installed. Stopping one that is
+	// not running is likewise not an error.
+	Stop() error
 }
+
+// Restart stops a service and starts it again.
+//
+// A helper rather than a method, because every platform implements it as its
+// two halves and a third entry point per platform would be three more chances
+// for them to disagree.
+func Restart(m Manager) error {
+	if err := m.Stop(); err != nil {
+		return err
+	}
+	return m.Start()
+}
+
+// ErrNotRunning reports that the service is installed but stopped.
+var ErrNotRunning = errors.New("service: not running")
 
 // New returns the Manager for this platform.
 func New() (Manager, error) { return newManager() }

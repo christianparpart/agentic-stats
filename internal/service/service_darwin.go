@@ -79,6 +79,48 @@ func (l launchd) Install(cfg Config) (Status, error) {
 	return l.Status()
 }
 
+// Start runs the installed agent.
+func (l launchd) Start() error {
+	if err := l.installed(); err != nil {
+		return err
+	}
+	// kickstart starts a loaded job, and -k restarts it if it is already
+	// running -- which is what "start what I installed" should mean.
+	if err := run("launchctl", "kickstart", "-k", domainTarget()); err != nil {
+		return fmt.Errorf("service: start agent: %w", err)
+	}
+	return nil
+}
+
+// Stop halts the agent, leaving the plist in place so it starts at next login.
+func (l launchd) Stop() error {
+	if err := l.installed(); err != nil {
+		return err
+	}
+	// SIGTERM through launchctl rather than bootout: bootout unregisters the
+	// job, which is uninstalling it in all but name, and the caller asked only
+	// for it to stop.
+	//
+	// The result is discarded because launchctl reports "already stopped" as a
+	// failure to signal, and that is the state the caller asked for.
+	_ = run("launchctl", "kill", "SIGTERM", domainTarget())
+	return nil
+}
+
+// installed reports whether a plist is present.
+func (l launchd) installed() error {
+	path, err := l.plistPath()
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return ErrNotInstalled
+	} else if err != nil {
+		return fmt.Errorf("service: stat %s: %w", path, err)
+	}
+	return nil
+}
+
 func (l launchd) Uninstall() error {
 	path, err := l.plistPath()
 	if err != nil {
