@@ -4,6 +4,18 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>agentic-stats</title>
+<script>
+  /* The theme, before anything is painted.
+     In the head and not with the rest of the script on purpose: applied after
+     first paint, a dark-theme reader gets a white flash on every reload, which
+     is worse than not remembering the choice at all. Wrapped because reading
+     storage throws outright in a private window and in a browser set to block
+     site data -- the page must still render, just without the memory. */
+  try {
+    var t = localStorage.getItem("theme");
+    if (t === "dark" || t === "light") document.documentElement.setAttribute("data-theme", t);
+  } catch (_) {}
+</script>
 <style>
   :root {
     color-scheme: light;
@@ -590,10 +602,37 @@ function showLogin() { showOnly("login"); }
 let lastData = {summary: null, daily: null, delivery: null};
 let failed = {};
 
+/* What the page remembers between visits, which is only ever a view choice:
+   which dimension the bars are stacked by, and the theme. Nothing about the
+   archive is cached here.
+
+   localStorage rather than a cookie because a cookie would be sent with every
+   /v1 request to be ignored by the server, and this survives a fresh window
+   just as well. Every access is guarded: a private window and a browser set to
+   block site data both throw on the property itself, so an unguarded read
+   would take the whole dashboard down with it. */
+function remembered(key, fallback) {
+  try {
+    return localStorage.getItem(key) ?? fallback;
+  } catch (_) {
+    return fallback;
+  }
+}
+
+function remember(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch (_) {
+    // Nothing to do and nothing worth saying: the page works, it just will not
+    // remember this next time.
+  }
+}
+
 // Which dimension the daily bars are stacked by. Its own variable rather than
-// part of lastData, which load() resets. Not persisted, matching the theme
-// toggle -- one reload behaviour for the whole page rather than two.
-let stackBy = "model";
+// part of lastData, which load() resets. A remembered value that this node no
+// longer offers needs no validation here -- dailyView falls back to the first
+// legend it was actually sent.
+let stackBy = remembered("stackBy", "model");
 
 /* Three requests, drawn as each one lands.
    The reports do not cost the same to answer and the archive only grows, so
@@ -761,6 +800,7 @@ document.getElementById("login-form").addEventListener("submit", async e => {
 document.getElementById("stack-by").addEventListener("change", e => {
   // Every dimension came down with the data, so this is a redraw, not a fetch.
   stackBy = e.currentTarget.value;
+  remember("stackBy", stackBy);
   render();
 });
 
@@ -777,7 +817,9 @@ document.getElementById("logout").addEventListener("click", async () => {
 document.getElementById("theme").addEventListener("click", () => {
   const dark = matchMedia("(prefers-color-scheme: dark)").matches;
   const cur = document.documentElement.getAttribute("data-theme") || (dark ? "dark" : "light");
-  document.documentElement.setAttribute("data-theme", cur === "dark" ? "light" : "dark");
+  const next = cur === "dark" ? "light" : "dark";
+  document.documentElement.setAttribute("data-theme", next);
+  remember("theme", next);
   render();
 });
 
