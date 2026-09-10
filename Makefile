@@ -7,6 +7,13 @@ PLATFORMS := darwin/arm64 linux/amd64 linux/arm64 windows/amd64
 # build is the CLI, and agentic-statsw.exe beside it is what the service runs.
 GOOS_NOW := $(shell $(GO) env GOOS)
 
+# `go build -o` writes exactly the name it is given, with no .exe appended, so
+# a Windows build without this leaves an extensionless binary beside a stale
+# agentic-stats.exe -- and the stale one is what a shell finds.
+ifeq ($(GOOS_NOW),windows)
+EXE := .exe
+endif
+
 .PHONY: check fmt vet lint test build release clean
 
 check: fmt vet lint test
@@ -25,7 +32,7 @@ test:
 	$(GO) test ./...
 
 build:
-	$(GO) build -o bin/agentic-stats ./cmd/agentic-stats
+	$(GO) build -o bin/agentic-stats$(EXE) ./cmd/agentic-stats
 ifeq ($(GOOS_NOW),windows)
 	$(GO) build -ldflags "-H windowsgui" -o bin/agentic-statsw.exe ./cmd/agentic-stats
 endif
