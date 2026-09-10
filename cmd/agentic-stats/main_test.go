@@ -7,6 +7,40 @@ import (
 	"github.com/christianparpart/agentic-stats/internal/mesh"
 )
 
+func TestNodeNamePrefersTheConfiguredName(t *testing.T) {
+	const hostname = "darkleon"
+
+	tests := []struct {
+		name       string
+		configured string
+		want       string
+	}{
+		{"unset falls back to the hostname", "", hostname},
+		{"configured wins", "darkleon-win", "darkleon-win"},
+		// A dual-boot machine reports one hostname from either side; the
+		// configured name is the only thing that tells the two halves apart.
+		{"configured may differ only by suffix", "darkleon-linux", "darkleon-linux"},
+		{"surrounding space is not part of a name", "  darkleon-win  ", "darkleon-win"},
+		{"a name of only space is no name", "   ", hostname},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := nodeName(tt.configured, func() string { return hostname })
+			if got != tt.want {
+				t.Errorf("nodeName(%q) = %q, want %q", tt.configured, got, tt.want)
+			}
+		})
+	}
+}
+
+// An unreadable hostname must not become a name of its own.
+func TestNodeNameCarriesAnEmptyFallbackThrough(t *testing.T) {
+	if got := nodeName("", func() string { return "" }); got != "" {
+		t.Errorf("nodeName = %q, want empty so peers fall back to reverse DNS", got)
+	}
+}
+
 func TestPeerLabelNamesAPeerWithoutLosingItsOriginID(t *testing.T) {
 	const full = "898962c0fdba8df8391bfda9504630cf"
 
@@ -27,8 +61,8 @@ func TestPeerLabelNamesAPeerWithoutLosingItsOriginID(t *testing.T) {
 			want: "darkleon (898962c0)",
 		},
 		{
-			// Two nodes can report one hostname -- a dual-boot machine, or two
-			// VMs off one image. The prefix is what separates them.
+			// Two dual-boot halves report one hostname; the prefix is what
+			// separates them in a report.
 			name: "same host, different origin",
 			peer: mesh.PeerHealth{ID: "1f4c9a02b7e3d5560a1c8842f90b6e77", Host: "darkleon"},
 			want: "darkleon (1f4c9a02)",

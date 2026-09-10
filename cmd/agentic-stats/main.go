@@ -376,7 +376,7 @@ func (n *node) buildMesh(keys *seal.Keys, cfg agentcfg.Config, log *slog.Logger)
 		StaticPeers:       cfg.Mesh.Peers,
 		Discovery:         cfg.Mesh.Discovery,
 		ExcludeInterfaces: cfg.Mesh.ExcludeInterfaces,
-		Hostname:          localHostname(),
+		Hostname:          nodeName(cfg.Mesh.Name, localHostname),
 	})
 	if err != nil {
 		return err
@@ -1064,6 +1064,24 @@ func reportPass(log *slog.Logger, stats collector.Stats, err error) error {
 		"stored", stats.Stored, "duplicates", stats.Duplicates,
 		"restarted", stats.Restarted, "gone", stats.Gone)
 	return nil
+}
+
+// nodeName is the name this node announces to peers.
+//
+// The configured name wins where there is one, because the hostname stops
+// being an identity the moment two nodes share it: a dual-boot machine reports
+// the same name from either side, and so do two VMs cloned off one image. The
+// origin ids differ underneath regardless -- this is only about a report a
+// person can read.
+//
+// The fallback is a parameter rather than a call to localHostname, so the
+// choice can be tested without asking the machine running the test what it is
+// called.
+func nodeName(configured string, fallback func() string) string {
+	if name := strings.TrimSpace(configured); name != "" {
+		return name
+	}
+	return fallback()
 }
 
 // localHostname is what this machine calls itself, for peers to label it by.

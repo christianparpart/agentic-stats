@@ -12,6 +12,14 @@
 # invent one, and never commit it. May also be given as $AGENTIC_STATS_PSK.
 psk = "GENERATED-BY-INIT-DO-NOT-USE-THIS-VALUE"
 
+# What this node calls itself in `status` and on the dashboard. The machine's
+# hostname when unset, which is right until two nodes share one: a dual-boot
+# machine reports the same hostname from either side, and so do two VMs cloned
+# off one image. They stay separate nodes underneath — the origin id lives in
+# the archive, not in the hostname — but without a name here they are two
+# identical labels in the same legend.
+# name = "darkleon-win"
+
 # Address other nodes connect to. Empty disables inbound peering.
 listen = ":8844"
 

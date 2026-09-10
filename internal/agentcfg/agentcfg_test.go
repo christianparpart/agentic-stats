@@ -64,6 +64,37 @@ func TestSaveRoundTrips(t *testing.T) {
 	}
 }
 
+// A node's name is optional, and absent is a meaningful value: it means "use
+// the hostname", which is what every single-OS machine wants.
+func TestMeshNameRoundTrips(t *testing.T) {
+	tests := []struct {
+		name string
+		want string
+	}{
+		{"unset stays unset", ""},
+		{"a name survives the round trip", "darkleon-win"},
+		{"so does one that differs only by suffix", "darkleon-linux"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := agentcfg.Save(path, agentcfg.Config{
+				Mesh: agentcfg.MeshConfig{PSK: "a-key", Name: tt.want},
+			}); err != nil {
+				t.Fatalf("Save: %v", err)
+			}
+			got, err := agentcfg.Load(path)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if got.Mesh.Name != tt.want {
+				t.Errorf("name = %q, want %q", got.Mesh.Name, tt.want)
+			}
+		})
+	}
+}
+
 // The file holds a device token, so its mode is a security property.
 func TestSaveWritesOwnerOnlyPermissions(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
