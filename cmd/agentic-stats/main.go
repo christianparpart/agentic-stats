@@ -410,6 +410,7 @@ func (n *node) buildMesh(keys *seal.Keys, cfg agentcfg.Config, log *slog.Logger)
 		Discovery:         cfg.Mesh.Discovery,
 		ExcludeInterfaces: cfg.Mesh.ExcludeInterfaces,
 		Hostname:          nodeName(cfg.Mesh.Name, localHostname),
+		Version:           buildVersion,
 	})
 	if err != nil {
 		return err
@@ -787,10 +788,17 @@ func runStatus(args []string, defaultPath string) error {
 	if err != nil {
 		return err
 	}
+	// This node's own build, printed next to the peers it is compared with:
+	// "is the fleet even" is not answerable from the peer lines alone.
+	fmt.Printf("version  %s\n", buildVersion)
 	fmt.Printf("peers    %d\n", len(health.Peers))
+	mine := version.Parse(buildVersion)
 	for _, p := range health.Peers {
 		fmt.Printf("  %-34s %s\n", peerLabel(p), describeAddrs(p.Addrs))
 		fmt.Printf("  %-34s %s%s\n", "", p.Reach, convergedAgo(p))
+		if p.Version != "" {
+			fmt.Printf("  %-34s running %s%s\n", "", p.Version, versionGap(mine, p.Version))
+		}
 		if p.Behind > 0 || p.Ahead > 0 {
 			fmt.Printf("  %-34s behind %d, ahead %d as of that exchange\n",
 				"", p.Behind, p.Ahead)
@@ -1132,6 +1140,22 @@ func localHostname() string {
 		return host
 	}
 	return name
+}
+
+// versionGap says how a peer's build sits against this node's.
+//
+// Only ever a remark beside the version itself, never a replacement for it:
+// two builds that name no release cannot be ranked, and saying nothing is the
+// honest answer there rather than implying they agree.
+func versionGap(mine version.Version, peer string) string {
+	switch mine.Compare(version.Parse(peer)) {
+	case version.OrderOlder:
+		return "  (newer than this node)"
+	case version.OrderNewer:
+		return "  (older than this node)"
+	default:
+		return ""
+	}
 }
 
 // peerLabel names a peer for a report.

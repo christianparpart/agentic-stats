@@ -76,6 +76,10 @@ type Config struct {
 	// Injected rather than read here: os.Hostname is the environment, and a
 	// test must be able to state what this machine is called.
 	Hostname string
+	// Version is the build this node is running, announced to peers so they
+	// can see which of them are behind. Injected for the same reason Hostname
+	// is: it is a fact about the build, not something this layer should read.
+	Version string
 }
 
 // Mesh is a node's peering subsystem.
@@ -142,7 +146,7 @@ func New(cfg Config) (*Mesh, error) {
 	}
 	nodeID := cfg.Store.OriginID()
 
-	syncer, err := meshsync.New(cfg.Store, meshsync.Config{Log: log, Host: cfg.Hostname})
+	syncer, err := meshsync.New(cfg.Store, meshsync.Config{Log: log, Host: cfg.Hostname, Version: cfg.Version})
 	if err != nil {
 		return nil, err
 	}
@@ -411,6 +415,7 @@ func (m *Mesh) exchange(ctx context.Context, conn *channel.Conn, label string) {
 	// what it is called, and a report about a failing peer is exactly where
 	// its name is most wanted.
 	m.recordPeerHost(conn.PeerNodeID, stats.PeerHost)
+	m.recordPeerVersion(conn.PeerNodeID, stats.PeerVersion)
 	if err != nil {
 		m.log.Warn("exchange failed", "peer", conn.PeerNodeID, "via", label, "error", err)
 		return
@@ -472,6 +477,21 @@ func (m *Mesh) recordPeerHost(peerID, host string) {
 	defer cancel()
 	if err := m.cfg.Store.SavePeerHostname(ctx, peerID, host); err != nil {
 		m.log.Debug("record peer hostname", "peer", peerID, "error", err)
+	}
+}
+
+// recordPeerVersion stores the build a peer reported running.
+//
+// Its own context for the same reason recordPeerHost has one: the exchange
+// context is very often already cancelled by the time we get here.
+func (m *Mesh) recordPeerVersion(peerID, version string) {
+	if peerID == "" || version == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := m.cfg.Store.SavePeerVersion(ctx, peerID, version); err != nil {
+		m.log.Debug("record peer version", "peer", peerID, "error", err)
 	}
 }
 

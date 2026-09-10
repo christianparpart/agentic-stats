@@ -381,3 +381,75 @@ func TestPeerHostnameFollowsARename(t *testing.T) {
 		t.Errorf("PeerNames[p1] = %q, want %q", names["p1"], "new-name")
 	}
 }
+
+// A node that has been switched off for a week is exactly the one worth
+// knowing the version of, so silence must never erase what it last reported.
+func TestPeerVersionIsKeptAndNeverErasedBySilence(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+
+	if err := db.SavePeer(ctx, store.Peer{ID: "p1", Addrs: []string{"192.168.86.24:8844"}}); err != nil {
+		t.Fatalf("SavePeer: %v", err)
+	}
+	if err := db.SavePeerVersion(ctx, "p1", "v0.1.0"); err != nil {
+		t.Fatalf("SavePeerVersion: %v", err)
+	}
+
+	// An exchange with a node too old to report one at all.
+	if err := db.SavePeerVersion(ctx, "p1", ""); err != nil {
+		t.Fatalf("SavePeerVersion with no version: %v", err)
+	}
+
+	peers, err := db.Peers(ctx)
+	if err != nil {
+		t.Fatalf("Peers: %v", err)
+	}
+	if len(peers) != 1 {
+		t.Fatalf("got %d peers, want 1", len(peers))
+	}
+	if peers[0].Version != "v0.1.0" {
+		t.Errorf("version = %q after a silent exchange, want it kept", peers[0].Version)
+	}
+	if peers[0].Addrs[0] != "192.168.86.24:8844" {
+		t.Errorf("addrs = %v, want the address preserved", peers[0].Addrs)
+	}
+}
+
+// An upgrade is the machine's own answer and must win over the previous one.
+func TestPeerVersionFollowsAnUpgrade(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+
+	for _, v := range []string{"v0.1.0", "v0.2.0", "dev"} {
+		if err := db.SavePeerVersion(ctx, "p1", v); err != nil {
+			t.Fatalf("SavePeerVersion(%q): %v", v, err)
+		}
+	}
+
+	peers, err := db.Peers(ctx)
+	if err != nil {
+		t.Fatalf("Peers: %v", err)
+	}
+	// Even a downgrade to an unreleased build: what the node reports is what
+	// it is running, and the report should say so rather than flatter it.
+	if peers[0].Version != "dev" {
+		t.Errorf("version = %q, want the most recently reported", peers[0].Version)
+	}
+}
+
+// The version column arrives by migration onto a table that already has rows.
+func TestPeerVersionIsEmptyBeforeAPeerReportsOne(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+
+	if err := db.SavePeer(ctx, store.Peer{ID: "p1", Addrs: []string{"10.0.0.1:8844"}}); err != nil {
+		t.Fatalf("SavePeer: %v", err)
+	}
+	peers, err := db.Peers(ctx)
+	if err != nil {
+		t.Fatalf("Peers: %v", err)
+	}
+	if peers[0].Version != "" {
+		t.Errorf("version = %q for a peer that never reported one, want empty", peers[0].Version)
+	}
+}

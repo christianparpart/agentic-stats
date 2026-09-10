@@ -431,6 +431,12 @@ type Peer struct {
 	// what names a machine on a network whose resolver knows nothing about it,
 	// which is the ordinary case for a home LAN.
 	Hostname string
+	// Version is the build the peer reported running, empty until it has said.
+	//
+	// Kept as reported rather than as a parsed release: "dev" or a commit hash
+	// is not something to converge on, but it is the answer to why that node
+	// is not converging.
+	Version string
 }
 
 // SavePeer records or refreshes a peer.
@@ -518,6 +524,30 @@ func (db *DB) SavePeerHostname(ctx context.Context, peerID, hostname string) err
 		peerID, db.now().Format(time.RFC3339Nano), hostname)
 	if err != nil {
 		return fmt.Errorf("store: save peer hostname: %w", err)
+	}
+	return nil
+}
+
+// SavePeerVersion records the build a peer reports running.
+//
+// Never with an empty value, for the same reason as the hostname: a peer too
+// old to report a version must not erase the version it gave before it was
+// upgraded, and a node that has gone quiet should still be reported as
+// whatever it was last known to be running.
+func (db *DB) SavePeerVersion(ctx context.Context, peerID, version string) error {
+	if peerID == "" {
+		return errors.New("store: peer id is required")
+	}
+	if version == "" {
+		return nil
+	}
+	_, err := db.sql.ExecContext(ctx, `
+		INSERT INTO peers (peer_id, addrs, last_seen, static, version)
+		VALUES (?, '', ?, 0, ?)
+		ON CONFLICT (peer_id) DO UPDATE SET version = excluded.version`,
+		peerID, db.now().Format(time.RFC3339Nano), version)
+	if err != nil {
+		return fmt.Errorf("store: save peer version: %w", err)
 	}
 	return nil
 }
@@ -622,7 +652,8 @@ func (db *DB) Peers(ctx context.Context) ([]Peer, error) {
 	rows, err := db.sql.QueryContext(ctx, `
 		SELECT peer_id, addrs, coalesce(last_seen, ''), static,
 		       coalesce(last_converged, ''), coalesce(last_error, ''),
-		       coalesce(last_vector, ''), coalesce(hostname, '')
+		       coalesce(last_vector, ''), coalesce(hostname, ''),
+		       coalesce(version, '')
 		  FROM peers ORDER BY peer_id`)
 	if err != nil {
 		return nil, fmt.Errorf("store: read peers: %w", err)
@@ -635,7 +666,8 @@ func (db *DB) Peers(ctx context.Context) ([]Peer, error) {
 		var addrs string
 		var static int
 		if err := rows.Scan(&p.ID, &addrs, &p.LastSeen, &static,
-			&p.LastConverged, &p.LastError, &p.LastVector, &p.Hostname); err != nil {
+			&p.LastConverged, &p.LastError, &p.LastVector, &p.Hostname,
+			&p.Version); err != nil {
 			return nil, fmt.Errorf("store: scan peer: %w", err)
 		}
 		if addrs != "" {

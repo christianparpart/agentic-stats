@@ -340,3 +340,79 @@ func TestAPeerThatReportsNoNameStillConverges(t *testing.T) {
 		t.Errorf("b stored %d records, want 4", statsB.Stored)
 	}
 }
+
+// exchangeVersioned runs one exchange with each side announcing a build.
+func exchangeVersioned(t *testing.T, a, b *store.DB, verA, verB string) (meshsync.Stats, meshsync.Stats) {
+	t.Helper()
+	sa, err := meshsync.New(a, meshsync.Config{Version: verA})
+	if err != nil {
+		t.Fatalf("sync.New: %v", err)
+	}
+	sb, err := meshsync.New(b, meshsync.Config{Version: verB})
+	if err != nil {
+		t.Fatalf("sync.New: %v", err)
+	}
+
+	left, right := net.Pipe()
+	t.Cleanup(func() { _ = left.Close(); _ = right.Close() })
+
+	ctx := context.Background()
+	type result struct {
+		stats meshsync.Stats
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		s, serr := sb.Exchange(ctx, right, "a")
+		done <- result{s, serr}
+	}()
+	statsA, err := sa.Exchange(ctx, left, "b")
+	if err != nil {
+		t.Fatalf("Exchange from a: %v", err)
+	}
+	res := <-done
+	if res.err != nil {
+		t.Fatalf("Exchange from b: %v", res.err)
+	}
+	return statsA, res.stats
+}
+
+// A node that was switched off has no way to notice the mesh moved on unless
+// its peers say what they are running.
+func TestEachSideLearnsWhatThePeerIsRunning(t *testing.T) {
+	a := openStore(t, "a")
+	b := openStore(t, "b")
+	fill(t, a, 0, 3)
+	fill(t, b, 0, 2)
+
+	statsA, statsB := exchangeVersioned(t, a, b, "v0.1.0", "v0.2.0")
+
+	if statsA.PeerVersion != "v0.2.0" {
+		t.Errorf("a learned peer version %q, want v0.2.0", statsA.PeerVersion)
+	}
+	if statsB.PeerVersion != "v0.1.0" {
+		t.Errorf("b learned peer version %q, want v0.1.0", statsB.PeerVersion)
+	}
+}
+
+// The compatibility case, and the one that matters most: every other node in
+// the fleet is running a build from before this field existed. An unknown
+// field decodes to its zero value, so the exchange must converge exactly as
+// before -- a new *kind* would have aborted it, which is why this is a field.
+func TestAPeerThatReportsNoVersionStillConverges(t *testing.T) {
+	a := openStore(t, "a")
+	b := openStore(t, "b")
+	fill(t, a, 0, 4)
+
+	statsA, statsB := exchangeVersioned(t, a, b, "v0.1.0", "")
+
+	if statsA.PeerVersion != "" {
+		t.Errorf("a learned peer version %q, want empty", statsA.PeerVersion)
+	}
+	if statsB.PeerVersion != "v0.1.0" {
+		t.Errorf("b learned peer version %q, want v0.1.0", statsB.PeerVersion)
+	}
+	if statsB.Stored != 4 {
+		t.Errorf("b stored %d records, want 4 -- records must flow regardless", statsB.Stored)
+	}
+}

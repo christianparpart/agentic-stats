@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/christianparpart/agentic-stats/internal/mesh"
+	"github.com/christianparpart/agentic-stats/internal/version"
 )
 
 func TestNodeNamePrefersTheConfiguredName(t *testing.T) {
@@ -127,5 +128,38 @@ func TestOtherCommandsStillReportAMissingConfigDirectory(t *testing.T) {
 
 	if err := run([]string{"status"}); err == nil {
 		t.Error("run(status) succeeded with no config directory, want the resolution error")
+	}
+}
+
+func TestVersionGapNamesTheDirectionOnlyWhenItIsKnown(t *testing.T) {
+	tests := []struct {
+		name string
+		mine string
+		peer string
+		want string
+	}{
+		{"peer ahead", "v0.1.0", "v0.2.0", "  (newer than this node)"},
+		{"peer behind", "v0.2.0", "v0.1.0", "  (older than this node)"},
+		{"in step", "v0.2.0", "v0.2.0", ""},
+		{"the v is not part of identity", "v0.2.0", "0.2.0", ""},
+
+		// A release outranks an unreleased build, in both directions.
+		{"peer on a release, we are not", "dev", "v0.1.0", "  (newer than this node)"},
+		{"we are on a release, peer is not", "v0.1.0", "dev", "  (older than this node)"},
+
+		// Two builds naming no release cannot be ranked, and saying nothing is
+		// the honest answer rather than implying they agree.
+		{"neither names a release", "dev", "v0.9.9-dirty", ""},
+		{"both unstamped", "dev", "dev", ""},
+		{"peer said nothing at all", "v0.1.0", "", "  (older than this node)"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := versionGap(version.Parse(tt.mine), tt.peer)
+			if got != tt.want {
+				t.Errorf("versionGap(%q, %q) = %q, want %q", tt.mine, tt.peer, got, tt.want)
+			}
+		})
 	}
 }

@@ -84,7 +84,10 @@ type PeerHealth struct {
 	// Host is what the peer calls itself, empty until it has said so over an
 	// exchange. Preferred over reverse DNS wherever a peer is named, because
 	// it is the machine's own answer and does not depend on a resolver.
-	Host     string    `json:"host,omitempty"`
+	Host string `json:"host,omitempty"`
+	// Version is the build the peer reported running, empty until it says.
+	// What it is compared against is the reader's business, not this layer's.
+	Version  string    `json:"version,omitempty"`
 	Addrs    []Address `json:"addrs"`
 	Static   bool      `json:"static"`
 	Reach    Reach     `json:"reach"`
@@ -155,6 +158,7 @@ func peerHealth(p store.Peer, mine store.VersionVector,
 	h := PeerHealth{
 		ID:            p.ID,
 		Host:          p.Hostname,
+		Version:       p.Version,
 		Addrs:         addresses(p.Addrs, names),
 		Static:        p.Static,
 		LastSeen:      p.LastSeen,
