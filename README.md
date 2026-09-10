@@ -47,7 +47,31 @@ everything**. There is no server. Each node serves its own dashboard.
 Working end to end. Nodes collect, discover each other, converge both ways, bridge through
 external storage, and each serves its own dashboard.
 
-## Quickstart
+## Install
+
+Every release publishes a static binary for each machine a node runs on —
+`linux`, `darwin` and `windows`, each for `amd64` and `arm64`. Download the one for
+yours from [the releases page](https://github.com/christianparpart/agentic-stats/releases),
+along with `SHA256SUMS`:
+
+```sh
+sha256sum -c SHA256SUMS --ignore-missing
+chmod +x agentic-stats-linux-amd64
+```
+
+`SHA256SUMS.sig` beside it is an ed25519 signature over that manifest, made with a key
+that lives only in the release pipeline — no node holds it, so no node can forge a
+release. One signature covers the whole set, and the manifest names the version it
+belongs to, so artifacts cannot be mixed between releases and an old release cannot be
+passed off as a new one. The signature is what the pipeline checks before publishing;
+verifying it yourself needs the public half, which is compiled into every binary
+(`internal/release`).
+
+Windows ships **two** binaries per architecture. `agentic-stats.exe` is the command line;
+`agentic-statsw.exe` beside it is what the service runs, and both belong in the same
+directory — see [Where a background node logs](#where-a-background-node-logs) for why.
+
+## Build from source
 
 Requires only Go. No database server, no cloud account, no certificates, no root.
 

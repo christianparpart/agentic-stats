@@ -1,0 +1,80 @@
+name: Release
+
+# Tags only. A release is a thing a node will fetch and execute, so it is made
+# deliberately by pushing a tag rather than as a side effect of a merge.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  # The whole CI suite, not a second definition of it: three operating systems,
+  # the race detector, and the check that nothing skipped itself. A release is
+  # the one build nobody re-cuts quietly, so it should be gated by more than a
+  # pull request gets -- and a Linux-only `go test ./...` here would have been
+  # less.
+  verify:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    name: Build, sign and publish
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      # Full history and tags: the version is `git describe` output, and a
+      # shallow clone cannot see the tag being released, so the binaries would
+      # be stamped with a bare hash and every node would read the release as
+      # unreleased.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build every platform and its manifest
+        run: make release
+
+      # The tag is what the release claims to be, and the binaries carry
+      # whatever `git describe` produced. If those disagree -- a tag pushed at
+      # a commit that is not what was checked out, say -- the fleet would
+      # converge on a version no artifact reports.
+      - name: Check the stamp matches the tag
+        run: |
+          stamped="$(make -s version)"
+          [ "$stamped" = "$GITHUB_REF_NAME" ] || {
+            echo "::error::tag $GITHUB_REF_NAME but binaries stamped $stamped"; exit 1; }
+
+      # Piped, not written to a file: the key never reaches the runner's disk,
+      # where it would outlive the step that used it.
+      - name: Sign the manifest
+        env:
+          SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -z "$SIGNING_KEY" ]; then
+            echo "::error::RELEASE_SIGNING_KEY is unset; refusing to publish unsigned artifacts"
+            exit 1
+          fi
+          printf '%s' "$SIGNING_KEY" |
+            go run ./internal/release/cmd/relsign sign - dist/SHA256SUMS dist/SHA256SUMS.sig
+
+      # A rehearsal of exactly what a node does before it will run a download:
+      # check the signature against the public key compiled into these very
+      # binaries, then check every artifact against the manifest. A mismatched
+      # keypair fails here rather than on every machine in the fleet.
+      - name: Verify what we are about to publish
+        run: go run ./internal/release/cmd/relsign verify dist/SHA256SUMS dist/SHA256SUMS.sig dist
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/*

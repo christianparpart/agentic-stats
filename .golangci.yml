@@ -78,6 +78,10 @@ linters:
             - "**/internal/collector/**"
             - "**/internal/derive/**"
             - "**/internal/pricing/**"
+            # release proves provenance with an asymmetric key no node holds.
+            # Reaching for the mesh key here would make a signature every node
+            # could forge, which is the one thing it must not be.
+            - "**/internal/release/**"
           deny:
             - pkg: github.com/christianparpart/agentic-stats/internal/seal
               desc: "only ingest, api and the mesh may hold keys (AGENT.md: Membership is the PSK)"
@@ -90,6 +94,8 @@ linters:
             - "**/internal/wire/**"
             - "**/internal/redact/**"
             - "**/internal/derive/**"
+            - "**/internal/release/**"
+            - "**/internal/version/**"
           deny:
             - pkg: github.com/christianparpart/agentic-stats/internal/api
               desc: "lower layers must not import the HTTP layer (AGENT.md: Architecture)"
