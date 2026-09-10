@@ -66,8 +66,8 @@ Deduplicate on `(session_id, uuid)`, never on path, and attribute the project fr
 record's own `cwd`.
 
 Both halves are implemented: the dedup as the `records_semantic_uuid` index, and the
-attribution as `derive.Identify` -> the `records.cwd` column -> `derive`'s project fold. The
-fold also collapses the worktree *directory* back to its project, by two rules -- the
+attribution as `derive.Identify` → the `records.cwd` column → `derive`'s project fold. The
+fold also collapses the worktree *directory* back to its project, by two rules — the
 assistant's own `<project>/.claude/worktrees/<name>` layout, which is exact, and a sibling
 directory suffixed with an issue or worktree marker, which is a convention. Both live in a
 table in `derive`, deliberately not in configuration: configuration is per machine and
@@ -103,8 +103,19 @@ derive session bounds from the first and last records that actually carry a time
 - **Derived** — `sessions`, `tool_calls`, `file_edits`, `compactions`, `pr_links`,
   `projects`, `daily_rollup`. All droppable and rebuildable from `raw_lines`.
 
-`reprocess` drops and recomputes every derived table. That operation is tested, because it is
-the guarantee the archive rests on.
+`reprocess` re-reads sealed bodies and rewrites the columns extracted from them, which is what
+makes "the raw line is the source of truth" a fact rather than a promise: a build that learns
+to read a new field can fill it in for history it collected before it could. It is tested,
+because it is the guarantee the archive rests on.
+
+It walks each origin from a watermark held in the `extraction` table, advanced in the same
+transaction as the batch it covers — the same discipline a replication watermark follows, and
+for the same reason. The watermark is keyed by an extraction version, so a new extracted
+column costs a bump of one constant rather than a migration of data. It rewrites only the
+derived columns; it never touches the sealed body, the content hash, or anything a peer keys
+or compares on, so a node that has reprocessed and one that has not still agree on every
+digest. `run` does a pass at startup and periodically thereafter; `agentic-stats reprocess`
+does one in the foreground.
 
 ## Parser lifecycle
 
@@ -126,7 +137,8 @@ Every derived row records the `parser_id` that produced it, so a fixed parser ca
 only the rows it touched.
 
 Lines no parser claims are stored anyway, marked `unrecognized`, counted, and alerted on.
-When a parser appears later, `reprocess --status=unrecognized` backfills the history.
+When a parser appears later, re-extraction backfills the history: bump the extraction version
+and every archive re-walks itself against the new parser.
 **A format we cannot parse yet costs nothing permanently; a format we failed to store is
 gone.**
 
@@ -154,7 +166,7 @@ generated worktree branches fold back to the originating branch.
 
 The branch is extracted into `records.git_branch` and stacks the daily chart. The directory
 fold described in trap 3 exists; the branch fold does not yet, and neither does the
-branch->issue mapping above.
+branch→issue mapping above.
 
 ## Timezones
 

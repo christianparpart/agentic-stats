@@ -5,8 +5,8 @@
 A peer-to-peer archive and analytics for AI coding assistants.
 
 You use Claude Code on a laptop, a desktop and a couple of VMs. Each machine keeps a
-detailed record of that work â€” token counts, models, git branches, every file edit as a
-unified diff, tool timings â€” **locally, and only for about 30 days.** Then it is deleted.
+detailed record of that work — token counts, models, git branches, every file edit as a
+unified diff, tool timings — **locally, and only for about 30 days.** Then it is deleted.
 
 `agentic-stats` runs one daemon on each machine. Daemons find each other on any network they
 share, authenticate from a shared key, and sync both ways until **every machine holds
@@ -19,18 +19,18 @@ everything**. There is no server. Each node serves its own dashboard.
 - **Per-machine tools cannot see the whole picture.** Existing analyzers read one machine's
   directory. If you work across several, none of them can answer "how much did I code this
   year".
-- **The data is genuinely rich** â€” exact per-request token accounting by type, git branch
+- **The data is genuinely rich** — exact per-request token accounting by type, git branch
   per line, diffs of every edit, and records that bind a session directly to the pull
   request it produced.
 
 ## What you get
 
 - **A durable archive, replicated.** Raw transcript lines, stored verbatim on every node.
-  The more machines you have, the safer the data â€” losing one loses nothing.
+  The more machines you have, the safer the data — losing one loses nothing.
 - **Encrypted at rest.** Record bodies are sealed with a key derived from your mesh key, so
   a stolen laptop or a copied database yields nothing.
 - **Cost.** API-equivalent cost from real token counts against a versioned price table,
-  including the cache-read/cache-write split â€” and what prompt caching actually saved you.
+  including the cache-read/cache-write split — and what prompt caching actually saved you.
 - **Time.** Active coding time, busy hours, busy days, streaks, trends by day/week/month/year.
 - **Projects.** What you actually worked on over time, across every machine. Attributed from
   the working directory each request ran in, so work that never opened a pull request still
@@ -64,6 +64,9 @@ make build
 ./bin/agentic-stats run           # dashboard on http://127.0.0.1:8899
 ./bin/agentic-stats once          # or a single pass and exit
 ./bin/agentic-stats status        # what this node holds, and its peers
+./bin/agentic-stats reprocess     # after an upgrade: re-read old records for
+                                  # columns this build extracts (`run` does it
+                                  # by itself; this is for `once`-only setups)
 
 # Start automatically at login.
 ./bin/agentic-stats install       # launchd, systemd --user, or Task Scheduler
@@ -74,7 +77,7 @@ make build
 `install` registers a **user** service on all three platforms: the daemon reads one
 person's home directory, so what runs is never root or an administrator.
 
-Installing it is free of that on Linux and macOS â€” a systemd `--user` unit and a launchd
+Installing it is free of that on Linux and macOS — a systemd `--user` unit and a launchd
 user agent both go in your own home directory. Windows is the exception: registering a
 logon task writes to the root Task Scheduler folder, which is administrator-only. That is
 a property of the folder, not of the daemon, and the task is still created with a limited
@@ -83,7 +86,7 @@ do not have to open a second elevated prompt and retype the command. Decline the
 and nothing is installed.
 
 On Linux `install` also attempts `loginctl enable-linger`, without which a user service
-stops the moment you log out â€” exactly wrong on a headless VM. If that fails it says so,
+stops the moment you log out — exactly wrong on a headless VM. If that fails it says so,
 along with the command to fix it, rather than leaving you with a collector that only runs
 while you are connected.
 
@@ -99,7 +102,7 @@ agentic-stats service    # is it installed, is it running
 ## Where a background node logs
 
 A service started at login has no terminal, so its log goes to a file beside the archive
-and configuration â€” `logs/agentic-stats.log`, rotated at 8 MB, three kept. Run the daemon
+and configuration — `logs/agentic-stats.log`, rotated at 8 MB, three kept. Run the daemon
 in a terminal and it prints there as well, because a log that vanishes when you run the
 thing by hand is the wrong kind of quiet.
 
@@ -112,7 +115,7 @@ full detail is in the file.
 Windows ships **two binaries built from the same source**, for the same reason python and
 node do. Whether a program gets a console window is decided by its subsystem, not by how it
 is launched, so a console binary registered as a logon task shows a window every time you
-log in â€” and a GUI-subsystem one does not, but a shell will not wait for it, which makes it
+log in — and a GUI-subsystem one does not, but a shell will not wait for it, which makes it
 useless as a command line. `agentic-stats.exe` is the command line; `agentic-statsw.exe`
 beside it is what the service runs. `install` picks the second automatically, and falls
 back to the first with a warning if it is missing, since a service with a window beats an
@@ -157,8 +160,8 @@ curl .../v1/health                 # the same, as JSON, with an overall ok/degra
 curl .../healthz                   # liveness only, and deliberately uninformative
 ```
 
-Peers are listed by name where they have one â€” `macbookpro.lan (192.168.86.25:8844)`
-â€” because an address alone rarely says which machine is missing. The daemon looks
+Peers are listed by name where they have one — `macbookpro.lan (192.168.86.25:8844)`
+— because an address alone rarely says which machine is missing. The daemon looks
 those up in the background and writes them into the archive; `status` reads what is
 written and never asks a resolver. A report about whether replication is working
 must not be able to hang on DNS, which is at its least reliable on exactly the
@@ -167,7 +170,7 @@ machine whose network you are investigating.
 `/v1/health` needs the mesh key, because peer identities, addresses and lag amount
 to a map of your fleet. `/healthz` does not, which is why it says nothing else.
 
-A peer that is switched off is not a fault â€” that is a laptop in a bag â€” so it is
+A peer that is switched off is not a fault — that is a laptop in a bag — so it is
 reported, not alarmed about. A node whose exchanges are failing, or that holds
 quarantined records, reads as `degraded`.
 
@@ -220,7 +223,7 @@ makes double-counting structurally impossible rather than a rule to remember.
 
 ## Privacy
 
-The daemon ships **full transcripts** by default â€” that is the point, since it doubles as
+The daemon ships **full transcripts** by default — that is the point, since it doubles as
 the backup for data your machines are about to delete. Transcripts contain your prompts and
 your source code.
 
