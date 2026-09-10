@@ -67,12 +67,25 @@ record's own `cwd`.
 
 Both halves are implemented: the dedup as the `records_semantic_uuid` index, and the
 attribution as `derive.Identify` → the `records.cwd` column → `derive`'s project fold. The
-fold also collapses the worktree *directory* back to its project, by two rules — the
-assistant's own `<project>/.claude/worktrees/<name>` layout, which is exact, and a sibling
-directory suffixed with an issue or worktree marker, which is a convention. Both live in a
-table in `derive`, deliberately not in configuration: configuration is per machine and
-nothing in the mesh exchanges it, so two nodes with different tables would draw different
-project legends from identical archives.
+fold also collapses the worktree *directory* back to its project, by three rules, tried in
+order:
+
+1. The assistant's own `<project>/.claude/worktrees/<name>` layout. Exact — the tool created
+   the directory.
+2. The repository the directory's sessions opened pull requests against, where that
+   repository's name appears in the path. Also exact, and the only rule that can identify a
+   worktree named after its work rather than after an issue, or tell a build tree deep inside
+   a repository from a project of its own. It may only *shorten* a path to something the path
+   already names, never rename it — working in one repository and shipping to another is
+   ordinary. Repositories that disagree fold nothing.
+3. A sibling directory suffixed with an issue or worktree marker. A convention, and the
+   dimension's note says so.
+
+None consults the filesystem or the local path separator, and none depends on what else the
+archive holds beyond the pull requests of the sessions in question — so a `cwd` collected on
+another machine folds identically here. The tables live in `derive`, deliberately not in
+configuration: configuration is per machine and nothing in the mesh exchanges it, so two
+nodes with different tables would draw different project legends from identical archives.
 
 ### 4. The project directory name is lossy
 

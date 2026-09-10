@@ -102,16 +102,102 @@ func newProjectRules(suffixes []string) (projectRules, error) {
 // of returns the project a working directory belongs to, or "" when the path
 // names none -- an empty value, or a bare filesystem root, which is somewhere
 // work happened but not a project it can be attributed to.
-func (r projectRules) of(cwd string) string {
+//
+// shippedTo is the repositories the sessions that ran in this directory opened
+// pull requests against, which is evidence rather than inference and is
+// therefore preferred over the name rules below.
+func (r projectRules) of(cwd string, shippedTo []string) string {
 	segs := r.stripWorktree(pathSegments(cwd))
 	if len(segs) == 0 {
 		return ""
+	}
+	if p := shippedProject(segs, shippedTo); p != "" {
+		return p
 	}
 	name := segs[len(segs)-1]
 	if isRoot(name) {
 		return ""
 	}
 	return r.foldSibling(name)
+}
+
+// shippedProject folds a directory onto the repository its work demonstrably
+// went to.
+//
+// This is the one rule here that is not a guess. The assistant records the
+// repository it opened a pull request against, so a directory whose sessions
+// shipped to `owner/fastcached` is a checkout of fastcached whatever it happens
+// to be called -- which no naming rule can establish. It is what tells
+// `fastcached-distributed-compilation` (a worktree, no issue number in sight)
+// from `contour-terminal` (a project of its own), and it is what stops a
+// build directory deep inside a repository from becoming a project called
+// `cl-release`.
+//
+// Two guards keep it safe:
+//
+// The repository's name must actually appear in the path, so this can only ever
+// shorten a directory, never rename it to something the path does not mention.
+// Working in one repository and opening a pull request against another is
+// ordinary, and must not silently re-label the first.
+//
+// Repositories that disagree fold nothing. A directory whose sessions shipped
+// to several places has no single answer, and saying nothing beats picking one
+// -- the same rule the session label follows.
+func shippedProject(segs, shippedTo []string) string {
+	var found string
+	for _, repo := range shippedTo {
+		hit := matchInPath(segs, repoName(repo))
+		switch {
+		case hit == "":
+			continue
+		case found == "":
+			found = hit
+		case found != hit:
+			return ""
+		}
+	}
+	return found
+}
+
+// matchInPath returns the path's own spelling of name where the path contains
+// it, and "" where it does not.
+//
+// The path's spelling and not the repository's, because they disagree: a
+// repository named `lastrada` checked out in `D:\Lastrada` must stay
+// `Lastrada`, which is what the person reading the chart called it. Matching
+// case-insensitively is what makes that comparison work at all, and is right on
+// its own terms -- Windows and macOS both treat those as one directory.
+func matchInPath(segs []string, name string) string {
+	if name == "" {
+		return ""
+	}
+	// A directory on the path is the repository itself: everything below it,
+	// a build tree included, is work on that project.
+	for _, seg := range segs {
+		if strings.EqualFold(seg, name) {
+			return seg
+		}
+	}
+	// Or the last segment is the repository plus a suffix, which is how a
+	// sibling worktree is named.
+	last := segs[len(segs)-1]
+	if len(last) > len(name) && strings.EqualFold(last[:len(name)], name) &&
+		(last[len(name)] == '-' || last[len(name)] == '_') {
+		return last[:len(name)]
+	}
+	return ""
+}
+
+// repoName is a repository's own name, without the owner that qualifies it.
+//
+// After the last separator, not the first: a self-hosted forge nests groups, so
+// `jpsc/developer/lastrada` is one repository called lastrada and not a
+// repository called `developer/lastrada`.
+func repoName(repo string) string {
+	if i := strings.LastIndexByte(repo, '/'); i >= 0 {
+		return repo[i+1:]
+	}
+	return repo
 }
 
 // stripWorktree drops a nested worktree suffix, leaving the project's own path.

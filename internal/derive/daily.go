@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
-	"strings"
 
 	"github.com/christianparpart/agentic-stats/internal/pricing"
 )
@@ -36,6 +35,10 @@ type links struct {
 	// even split has a stable divisor and two nodes agree on it.
 	pullRequests map[string][]string
 	repos        map[string][]string
+	// shipped maps a working directory to the repositories the sessions that
+	// ran in it opened pull requests against. It is what makes the project fold
+	// evidence rather than inference.
+	shipped map[string][]string
 	// projects maps a working directory to the project it belongs to, folded
 	// out of any worktree. Resolved once per distinct directory rather than per
 	// row: the grid holds a few thousand rows over a few dozen directories.
@@ -86,9 +89,10 @@ func stackings() []stacking {
 			stack: StackProject,
 			label: "Project",
 			note: "The directory each request ran in, from the record itself. " +
-				"Worktrees fold back into the project they came from -- the " +
-				"assistant's own exactly, and a sibling directory named after " +
-				"an issue by convention.",
+				"Worktrees and build trees fold back into the project they " +
+				"belong to -- exactly where a pull request says which " +
+				"repository it is, and by convention where only the directory " +
+				"name suggests it.",
 			divide: func(r gridRow, l links) []share {
 				if p := l.projects[r.cwd]; p != "" {
 					return []share{{key: p, weight: 1}}
@@ -440,13 +444,30 @@ func (s *Service) sessionLinks(ctx context.Context, grid []gridRow) (links, erro
 	if err := rows.Err(); err != nil {
 		return links{}, fmt.Errorf("derive: session links: %w", err)
 	}
-	l := links{
-		pullRequests: sorted(prs),
-		repos:        sorted(repos),
-		projects:     s.projectsOf(grid),
-	}
+	l := links{pullRequests: sorted(prs), repos: sorted(repos)}
+	l.shipped = shippedByDirectory(l.repos, grid)
+	l.projects = s.projectsOf(grid, l.shipped)
 	l.byProject = sessionProjects(l, grid)
 	return l, nil
+}
+
+// shippedByDirectory carries what a session shipped over to the directories it
+// ran in, so a directory can be folded onto the repository its work went to.
+//
+// A session that moved between directories -- into a worktree, most often --
+// lends its pull requests to both, which is correct: the work went to that
+// repository from both places.
+func shippedByDirectory(repos map[string][]string, grid []gridRow) map[string][]string {
+	byCWD := make(map[string]map[string]struct{})
+	for _, r := range grid {
+		if r.cwd == "" {
+			continue
+		}
+		for _, repo := range repos[r.session] {
+			add(byCWD, r.cwd, repo)
+		}
+	}
+	return sorted(byCWD)
 }
 
 func add(m map[string]map[string]struct{}, key, value string) {
@@ -474,13 +495,13 @@ func sorted(m map[string]map[string]struct{}) map[string][]string {
 }
 
 // projectsOf resolves each distinct working directory in the grid once.
-func (s *Service) projectsOf(grid []gridRow) map[string]string {
+func (s *Service) projectsOf(grid []gridRow, shipped map[string][]string) map[string]string {
 	out := make(map[string]string)
 	for _, r := range grid {
 		if _, done := out[r.cwd]; done {
 			continue
 		}
-		out[r.cwd] = s.projects.of(r.cwd)
+		out[r.cwd] = s.projects.of(r.cwd, shipped[r.cwd])
 	}
 	return out
 }
@@ -532,17 +553,7 @@ func sessionProjects(l links, grid []gridRow) map[string]string {
 		if _, named := out[session]; named || len(repos) != 1 {
 			continue
 		}
-		out[session] = strings.TrimPrefix(repos[0], repoOwner(repos[0]))
+		out[session] = repoName(repos[0])
 	}
 	return out
-}
-
-// repoOwner is the "owner/" prefix of a repository, which a session label
-// drops: the owner is the same for every repository in most meshes, and the
-// name is what distinguishes them.
-func repoOwner(repo string) string {
-	if i := strings.IndexByte(repo, '/'); i >= 0 {
-		return repo[:i+1]
-	}
-	return ""
 }

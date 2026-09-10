@@ -457,3 +457,55 @@ func TestAnEmptyArchiveReportsEmptyRatherThanNull(t *testing.T) {
 		t.Errorf("got %d days from an empty archive", len(activity.Days))
 	}
 }
+
+// A worktree with nothing in its name to give it away still belongs to its
+// project, because the pull request it opened says which repository it is.
+//
+// This is the case the naming rules cannot reach and must not guess at:
+// `fastcached-distributed-compilation` looks exactly like a project of its own,
+// and `contour-terminal` -- which is one -- looks exactly like a worktree. Only
+// the pull request tells them apart.
+func TestAWorktreeWithNoMarkerFoldsOnItsPullRequest(t *testing.T) {
+	n := newNode(t)
+	ctx := context.Background()
+
+	if _, err := n.writer.Ingest(ctx, records(
+		dayLineIn("2026-09-01", `D:\fastcached`, "master", "s-main", "r1", "claude-opus-5", 500),
+		// A worktree named after the work, not after an issue number.
+		dayLineIn("2026-09-01", `D:\fastcached-distributed-compilation`,
+			"feature/distributed-compilation", "s-wt", "r2", "claude-opus-5", 500),
+		// A build tree inside the repository, which is not a project either.
+		dayLineIn("2026-09-01", `D:\fastcached\out\build\cl-release`,
+			"master", "s-build", "r3", "claude-opus-5", 500),
+		// And a genuinely separate project whose name merely looks like a
+		// worktree of another. Its pull request names the path, so it stays.
+		dayLineIn("2026-09-01", `D:\contour-terminal`, "master", "s-other", "r4", "claude-opus-5", 500),
+		prLink("s-wt", "LASTRADA-Software/fastcached", 7),
+		prLink("s-build", "LASTRADA-Software/fastcached", 8),
+		prLink("s-other", "contour-terminal/contour-terminal", 9),
+	)); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	activity, err := n.derive.Daily(ctx)
+	if err != nil {
+		t.Fatalf("Daily: %v", err)
+	}
+	d := activity.Days[0]
+
+	if got := len(d.Stacks[derive.StackProject]); got != 2 {
+		t.Fatalf("the day divides into %d projects, want fastcached and contour-terminal", got)
+	}
+	fastcached := shareOf(d, derive.StackProject, "fastcached")
+	other := shareOf(d, derive.StackProject, "contour-terminal")
+	if math.Abs(fastcached-3*other) > 1e-9 {
+		t.Errorf("fastcached got $%.6f and contour-terminal $%.6f; want three of the four rows folded",
+			fastcached, other)
+	}
+	// The one that only looks like a worktree keeps its own name.
+	if other <= 0 {
+		t.Error("contour-terminal was folded away; a project was lost into another")
+	}
+	if total := fastcached + other; math.Abs(total-d.CostUSD) > 1e-9 {
+		t.Errorf("projects sum to $%.6f, want the day's $%.6f", total, d.CostUSD)
+	}
+}
