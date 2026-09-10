@@ -21,6 +21,7 @@ import (
 	meshsync "github.com/christianparpart/agentic-stats/internal/mesh/sync"
 	"github.com/christianparpart/agentic-stats/internal/seal"
 	"github.com/christianparpart/agentic-stats/internal/store"
+	"github.com/christianparpart/agentic-stats/internal/supervise"
 )
 
 // dialInterval is how often the node sweeps its known peers.
@@ -304,6 +305,11 @@ func (m *Mesh) dialAndSync(ctx context.Context, addr string) bool {
 
 // exchange converges over an established connection and records the peer.
 func (m *Mesh) exchange(ctx context.Context, conn *channel.Conn, label string) {
+	// This is where bytes a peer chose meet code that parses them, so it is
+	// where a malformed frame would panic. Contained here rather than left to
+	// the supervisor because restarting the whole mesh would drop every other
+	// peer's exchange over one peer's bad frame.
+	defer supervise.Recover(m.log, "peer exchange with "+label)
 	defer func() { _ = conn.Close() }() // one exchange per connection
 
 	// Without this, cancelling ctx does not reach a read already blocked in the

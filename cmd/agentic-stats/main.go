@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"syscall"
 	"time"
 
@@ -37,6 +38,7 @@ import (
 	"github.com/christianparpart/agentic-stats/internal/source"
 	"github.com/christianparpart/agentic-stats/internal/source/claudecode"
 	"github.com/christianparpart/agentic-stats/internal/store"
+	"github.com/christianparpart/agentic-stats/internal/supervise"
 )
 
 // version identifies the build. Overridden at release time via -ldflags.
@@ -407,9 +409,104 @@ func runNode(args []string, defaultPath string, m mode) error {
 	if addr == "" {
 		addr = n.cfg.Dashboard.Listen
 	}
+	// Resolve once, before supervision starts. An address that cannot be
+	// parsed is operator error and must fail loudly and immediately; a bind
+	// that fails later may just be a port not yet released, and is retried.
+	if _, rerr := net.ResolveTCPAddr("tcp", addr); rerr != nil {
+		return fmt.Errorf("dashboard.listen %q: %w", addr, rerr)
+	}
+
+	poll := *interval
+	if poll <= 0 {
+		if poll, err = time.ParseDuration(n.cfg.Agent.PollInterval); err != nil {
+			return fmt.Errorf("parse poll_interval: %w", err)
+		}
+	}
+
+	// Each subsystem is supervised independently, so a peer that cannot be
+	// reached or a dashboard port briefly held by a previous run costs a
+	// restart of that one thing. Collection in particular must survive
+	// everything else: transcripts it misses are deleted by their owner and
+	// never come back.
+	subsystems := []supervise.Config{
+		{Name: "collector", Run: func(ctx context.Context) error {
+			return n.collectLoop(ctx, poll, log)
+		}},
+		{Name: "dashboard", Run: func(ctx context.Context) error {
+			return n.serveDashboard(ctx, addr, *configPath, log)
+		}},
+	}
+	if n.mesh != nil {
+		subsystems = append(subsystems, supervise.Config{Name: "peering", Run: n.mesh.Run})
+	}
+	if n.bridge != nil {
+		subsystems = append(subsystems, supervise.Config{Name: "bridge", Run: func(ctx context.Context) error {
+			return n.runBridge(ctx, log)
+		}})
+	}
+
+	runCtx, stopAll := context.WithCancel(ctx)
+	defer stopAll()
+
+	failed := make(chan error, len(subsystems))
+	var wg sync.WaitGroup
+	for _, s := range subsystems {
+		s.Logger = log
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if serr := supervise.Run(runCtx, s); serr != nil && !errors.Is(serr, context.Canceled) {
+				failed <- serr
+			}
+		}()
+	}
+
+	// The first unrecoverable failure takes the daemon down, but only after
+	// every other subsystem has been asked to stop and has done so.
+	var fatal error
+	select {
+	case fatal = <-failed:
+	case <-ctx.Done():
+		log.Info("stopping")
+	}
+	stopAll()
+	wg.Wait()
+	return fatal
+}
+
+// collectLoop collects on an interval until ctx is done.
+func (n *node) collectLoop(ctx context.Context, poll time.Duration, log *slog.Logger) error {
+	ticker := time.NewTicker(poll)
+	defer ticker.Stop()
+	for {
+		func() {
+			// One bad transcript must not end collection for the others, and a
+			// restart of this loop would re-scan everything to reach the same
+			// place. Contained here rather than left to the supervisor.
+			defer supervise.Recover(log, "collection pass")
+			stats, passErr := n.coll.CollectOnce(ctx)
+			if err := reportPass(log, stats, passErr); err != nil {
+				// A failed pass must not kill the daemon: the cursor did not
+				// advance, so the next pass retries the same data.
+				log.Error("collection pass failed", "error", err)
+			}
+		}()
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+	}
+}
+
+// serveDashboard serves the dashboard until ctx is done.
+//
+// The server is built per attempt because an http.Server that has been shut
+// down cannot be served again, and this may be restarted.
+func (n *node) serveDashboard(ctx context.Context, addr, configPath string, log *slog.Logger) error {
 	srv, err := api.NewServer(api.Config{Derive: n.derive, Keys: n.keys, Logger: log})
 	if err != nil {
-		return err
+		return supervise.Permanent(err)
 	}
 	httpServer := &http.Server{
 		Addr:              addr,
@@ -424,9 +521,10 @@ func runNode(args []string, defaultPath string, m mode) error {
 	// a certificate warning. Anywhere else, encrypt.
 	useTLS := !isLoopback(addr)
 	if useTLS {
-		cert, cerr := dashboardCertificate(n.cfg, filepath.Dir(*configPath))
+		cert, cerr := dashboardCertificate(n.cfg, filepath.Dir(configPath))
 		if cerr != nil {
-			return cerr
+			// A certificate we cannot build is configuration, not weather.
+			return supervise.Permanent(cerr)
 		}
 		httpServer.TLSConfig = &tls.Config{
 			MinVersion:   tls.VersionTLS12,
@@ -434,73 +532,39 @@ func runNode(args []string, defaultPath string, m mode) error {
 		}
 	}
 
-	httpErr := make(chan error, 1)
+	scheme := "http"
+	if useTLS {
+		scheme = "https"
+	}
+	log.Info("dashboard listening",
+		"url", scheme+"://"+addr, "origin", n.db.OriginID(), "version", version)
+	log.Info(api.Describe())
+	if useTLS && n.cfg.Dashboard.TLSCert == "" {
+		log.Warn("using a self-signed certificate; your browser will warn once " +
+			"unless you supply dashboard.tls_cert")
+	}
+
+	served := make(chan error, 1)
 	go func() {
-		scheme := "http"
+		var serr error
 		if useTLS {
-			scheme = "https"
+			serr = httpServer.ListenAndServeTLS("", "")
+		} else {
+			serr = httpServer.ListenAndServe()
 		}
-		log.Info("dashboard listening",
-			"url", scheme+"://"+addr, "origin", n.db.OriginID(), "version", version)
-		log.Info(api.Describe())
-		if useTLS {
-			if n.cfg.Dashboard.TLSCert == "" {
-				log.Warn("using a self-signed certificate; your browser will warn once " +
-					"unless you supply dashboard.tls_cert")
-			}
-			if err := httpServer.ListenAndServeTLS("", ""); err != nil &&
-				!errors.Is(err, http.ErrServerClosed) {
-				httpErr <- err
-			}
-			return
+		if errors.Is(serr, http.ErrServerClosed) {
+			serr = nil
 		}
-		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			httpErr <- err
-		}
+		served <- serr
 	}()
 
-	// Peering runs alongside collection.
-	meshErr := make(chan error, 1)
-	if n.mesh != nil {
-		go func() {
-			if err := n.mesh.Run(ctx); err != nil {
-				meshErr <- err
-			}
-		}()
-	}
-
-	if n.bridge != nil {
-		go n.runBridge(ctx, log)
-	}
-
-	poll := *interval
-	if poll <= 0 {
-		if poll, err = time.ParseDuration(n.cfg.Agent.PollInterval); err != nil {
-			return fmt.Errorf("parse poll_interval: %w", err)
-		}
-	}
-	ticker := time.NewTicker(poll)
-	defer ticker.Stop()
-
-	for {
-		stats, passErr := n.coll.CollectOnce(ctx)
-		if err := reportPass(log, stats, passErr); err != nil {
-			// A failed pass must not kill the daemon: the cursor did not
-			// advance, so the next pass retries the same data.
-			log.Error("collection pass failed", "error", err)
-		}
-		select {
-		case err := <-httpErr:
-			return fmt.Errorf("dashboard: %w", err)
-		case err := <-meshErr:
-			return fmt.Errorf("mesh: %w", err)
-		case <-ctx.Done():
-			log.Info("stopping")
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
-			return httpServer.Shutdown(shutdownCtx)
-		case <-ticker.C:
-		}
+	select {
+	case serr := <-served:
+		return serr
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		return httpServer.Shutdown(shutdownCtx)
 	}
 }
 
@@ -566,7 +630,7 @@ func runStatus(args []string, defaultPath string) error {
 //
 // A failure is logged and retried rather than fatal: a bridge folder living on
 // a network share or a sync client is expected to be intermittently absent.
-func (n *node) runBridge(ctx context.Context, log *slog.Logger) {
+func (n *node) runBridge(ctx context.Context, log *slog.Logger) error {
 	every := 5 * time.Minute
 	if n.cfg.Bridge.Interval != "" {
 		if parsed, err := time.ParseDuration(n.cfg.Bridge.Interval); err == nil {
@@ -589,7 +653,7 @@ func (n *node) runBridge(ctx context.Context, log *slog.Logger) {
 		}
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		case <-ticker.C:
 		}
 	}
