@@ -134,5 +134,7 @@ func Save(path string, cfg Config) error {
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("agentcfg: close %s: %w", path, err)
 	}
-	return nil
+	// The 0600 above is honoured on Unix and ignored on Windows, where the
+	// equivalent has to be spelled out as an access list.
+	return restrictToOwner(path)
 }

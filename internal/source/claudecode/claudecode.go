@@ -10,7 +10,9 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/christianparpart/agentic-stats/internal/source"
@@ -109,12 +111,37 @@ func New(cfg Config) (*Source, error) {
 		}
 		roots = defaultRoots(cfg.Home, cfg.Platform)
 	}
+	prefixes := make([]string, 0, len(cfg.ExcludePrefixes))
+	for _, p := range cfg.ExcludePrefixes {
+		if p = normalizePath(p); p != "" {
+			prefixes = append(prefixes, p)
+		}
+	}
 	return &Source{
 		fsys:            cfg.FS,
 		roots:           roots,
-		excludePrefixes: append([]string(nil), cfg.ExcludePrefixes...),
+		excludePrefixes: prefixes,
 		maxBytesPerRead: cfg.MaxBytesPerRead,
 	}, nil
+}
+
+// normalizePath puts a path in the one form exclusion comparisons use.
+//
+// Separators are unified and the path is cleaned, because the two sides of the
+// comparison come from different places: the walker builds paths with filepath
+// while an exclusion is typed into a TOML file by hand, and on Windows those
+// disagree about the separator. Case is folded there too, since Windows paths
+// are case-insensitive and an exclusion that fails on capitalisation is a
+// privacy hole rather than an inconvenience.
+func normalizePath(p string) string {
+	if p == "" {
+		return ""
+	}
+	p = filepath.Clean(filepath.FromSlash(p))
+	if runtime.GOOS == "windows" {
+		p = strings.ToLower(p)
+	}
+	return p
 }
 
 // defaultRoots resolves the built-in root table for one platform.
@@ -201,13 +228,31 @@ func (s *Source) newStream(path string) (source.Stream, error) {
 }
 
 // excluded reports whether a path falls under a configured exclusion.
+//
+// Both sides are normalized first, and the match is on a path boundary rather
+// than on raw characters. The previous string-prefix test was wrong twice over:
+// it silently excluded nothing on Windows, where the walker produces
+// backslashes and a configured prefix usually has forward slashes, so a project
+// the user had asked to withhold was collected and replicated to every peer;
+// and everywhere it over-matched, so excluding /home/me/work also withheld
+// /home/me/workspace. Under-exclusion is a privacy failure and over-exclusion
+// is silent data loss, so neither is acceptable.
 func (s *Source) excluded(path string) bool {
+	path = normalizePath(path)
 	for _, prefix := range s.excludePrefixes {
-		if prefix != "" && strings.HasPrefix(path, prefix) {
+		if path == prefix {
+			return true
+		}
+		if strings.HasPrefix(path, prefix) && isPathBoundary(path[len(prefix):]) {
 			return true
 		}
 	}
 	return false
+}
+
+// isPathBoundary reports whether what follows a prefix begins a new segment.
+func isPathBoundary(rest string) bool {
+	return rest != "" && os.IsPathSeparator(rest[0])
 }
 
 // isTranscript reports whether a path is an append-only transcript stream.

@@ -127,7 +127,11 @@ WITH folded AS (
 
 // Summarize computes the whole-archive summary.
 func (s *Service) Summarize(ctx context.Context) (Summary, error) {
-	var sum Summary
+	// Empty rather than nil, so an archive with nothing in it serialises as []
+	// and not null. A fresh node is the common case -- init, run, open the
+	// dashboard before the first pass finishes -- and a consumer that reasonably
+	// expects a list should not meet null on its very first request.
+	sum := Summary{Models: []ModelUsage{}}
 	db := s.db.SQL()
 
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM records`).Scan(&sum.Lines); err != nil {
@@ -263,7 +267,9 @@ type Delivery struct {
 // session to each would triple-count -- which is the same error the requestId
 // fold exists to prevent, arriving by a different route.
 func (s *Service) Deliveries(ctx context.Context) (Delivery, error) {
-	var out Delivery
+	// Empty rather than nil, for the same reason as Summarize: a list-shaped
+	// field should never serialise as null.
+	out := Delivery{PullRequests: []PullRequest{}}
 
 	rows, err := s.db.SQL().QueryContext(ctx, foldedUsageCTE+`,
 links AS (

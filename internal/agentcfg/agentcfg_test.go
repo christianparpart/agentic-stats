@@ -1,7 +1,6 @@
 package agentcfg_test
 
 import (
-	"os"
 	"path/filepath"
 	"testing"
 
@@ -73,11 +72,6 @@ func TestSaveWritesOwnerOnlyPermissions(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("Stat: %v", err)
-	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Errorf("config mode = %#o, want 0600: it holds the mesh key", perm)
-	}
+	assertOwnerOnly(t, path)
+
 }

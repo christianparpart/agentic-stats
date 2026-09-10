@@ -435,9 +435,12 @@ function render() {
   tiles(summary);
   document.getElementById("scope").textContent =
     `${fmtInt(summary.lines)} archived lines · ${daily.days.length} active days`;
-  dailyChart(document.getElementById("daily"), daily.days);
-  modelChart(document.getElementById("models"), summary.models);
-  modelTable(summary.models);
+  // A field the server sends as a list can still arrive null from an older
+  // node in the mesh -- every node serves its own dashboard, and they are not
+  // upgraded together. deliveryView already defends itself the same way.
+  dailyChart(document.getElementById("daily"), daily.days || []);
+  modelChart(document.getElementById("models"), summary.models || []);
+  modelTable(summary.models || []);
   deliveryView(delivery);
 }
 
