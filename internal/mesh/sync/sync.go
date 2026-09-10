@@ -120,6 +120,9 @@ type Stats struct {
 	Duplicates int
 	// Forked is how many were quarantined as evidence of a duplicated origin.
 	Forked int
+	// PeerVector is what the peer said it held, recorded so replication lag
+	// can be computed rather than guessed. Nil if the peer never announced.
+	PeerVector store.VersionVector
 }
 
 // Syncer converges a local replica with peers.
@@ -336,6 +339,7 @@ func (s *Syncer) receive(ctx context.Context, r io.Reader, peerVector chan<- ann
 				return stats, errors.New("sync: peer sent a second vector")
 			}
 			peerVector <- announcement{vector: msg.Vector, digests: msg.Digests}
+			stats.PeerVector = msg.Vector
 			published = true
 		case kindDone:
 			return stats, nil

@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -513,7 +514,11 @@ func (n *node) collectLoop(ctx context.Context, poll time.Duration, log *slog.Lo
 // The server is built per attempt because an http.Server that has been shut
 // down cannot be served again, and this may be restarted.
 func (n *node) serveDashboard(ctx context.Context, addr, configPath string, log *slog.Logger) error {
-	srv, err := api.NewServer(api.Config{Derive: n.derive, Keys: n.keys, Logger: log})
+	cfg := api.Config{Derive: n.derive, Keys: n.keys, Logger: log}
+	if n.mesh != nil {
+		cfg.Health = n.mesh.Health
+	}
+	srv, err := api.NewServer(cfg)
 	if err != nil {
 		return supervise.Permanent(err)
 	}
@@ -614,17 +619,28 @@ func runStatus(args []string, defaultPath string) error {
 		}
 		fmt.Printf("  %s  up to %d%s\n", origin, seq, marker)
 	}
-	peers, err := n.mesh.KnownPeers(ctx)
+	health, err := n.mesh.Health(ctx)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("peers    %d\n", len(peers))
-	for _, p := range peers {
-		seen := p.LastSeen
-		if seen == "" {
-			seen = "never"
+	fmt.Printf("peers    %d\n", len(health.Peers))
+	for _, p := range health.Peers {
+		fmt.Printf("  %-34s %v\n", p.ID, p.Addrs)
+		fmt.Printf("  %-34s %s%s\n", "", p.Reach, convergedAgo(p))
+		if p.Behind > 0 || p.Ahead > 0 {
+			fmt.Printf("  %-34s behind %d, ahead %d as of that exchange\n",
+				"", p.Behind, p.Ahead)
 		}
-		fmt.Printf("  %-34s %v  last seen %s\n", p.ID, p.Addrs, seen)
+		if p.LastError != "" {
+			fmt.Printf("  %-34s last error: %s\n", "", p.LastError)
+		}
+	}
+	if stalled := notConverging(health); len(stalled) > 0 {
+		fmt.Printf("\nWARNING: %d peer(s) are not converging: %s\n",
+			len(stalled), strings.Join(stalled, ", "))
+		fmt.Println("Their records are not reaching this node, and this node's are not")
+		fmt.Println("reaching them. A machine that is switched off is expected; one that")
+		fmt.Println("is running is worth looking into.")
 	}
 
 	if quarantined > 0 {
@@ -666,6 +682,30 @@ func (n *node) runBridge(ctx context.Context, log *slog.Logger) error {
 		case <-ticker.C:
 		}
 	}
+}
+
+// convergedAgo renders how long ago a peer last converged.
+func convergedAgo(p mesh.PeerHealth) string {
+	if p.LastConverged == "" {
+		return ""
+	}
+	return fmt.Sprintf(", last converged %s ago",
+		(time.Duration(p.SinceConverged) * time.Second).Round(time.Second))
+}
+
+// notConverging names the peers worth warning about.
+//
+// A peer that has never been reached is left out on purpose: that is usually an
+// address configured for a machine not switched on yet, and warning about it
+// would train the reader to ignore the warning that matters.
+func notConverging(h mesh.Health) []string {
+	var out []string
+	for _, p := range h.Peers {
+		if p.Reach == mesh.ReachFailing || p.Reach == mesh.ReachStale {
+			out = append(out, p.ID)
+		}
+	}
+	return out
 }
 
 // runInstall registers the daemon to start at login.

@@ -404,6 +404,19 @@ type Peer struct {
 	Addrs    []string
 	LastSeen string
 	Static   bool
+
+	// LastConverged is when data last actually moved with this peer, empty if
+	// it never has. Distinct from LastSeen, which a beacon announcement
+	// satisfies without anything being exchanged.
+	LastConverged string
+	// LastError is why the most recent attempt failed, empty if it did not.
+	// Kept alongside LastConverged rather than replacing it, so the report can
+	// say "converged an hour ago and has been failing since".
+	LastError string
+	// LastVector is what the peer said it held at the last exchange, as the
+	// sync layer's JSON. Opaque here: the store keeps it, derive and the API
+	// interpret it.
+	LastVector string
 }
 
 // SavePeer records or refreshes a peer.
@@ -433,10 +446,52 @@ func (db *DB) SavePeer(ctx context.Context, p Peer) error {
 	return nil
 }
 
+// RecordConvergence notes the outcome of one exchange with a peer.
+//
+// A success clears the last error and a failure leaves the last success in
+// place, so the pair together answer "when did this last work, and what has
+// been happening since" -- which is the question worth asking of a mesh, and
+// which neither field can answer alone.
+//
+// The peer row is created if this is the first thing heard from it, so a peer
+// that fails on its very first exchange is still visible as a peer that is
+// failing rather than not appearing at all.
+func (db *DB) RecordConvergence(ctx context.Context, peerID, vector string, cause error) error {
+	if peerID == "" {
+		return errors.New("store: peer id is required")
+	}
+	now := db.now().Format(time.RFC3339Nano)
+
+	var converged, lastErr, vec any
+	if cause != nil {
+		lastErr = cause.Error()
+	} else {
+		converged, vec = now, vector
+	}
+
+	_, err := db.sql.ExecContext(ctx, `
+		INSERT INTO peers (peer_id, addrs, last_seen, static,
+		                   last_converged, last_error, last_vector)
+		VALUES (?, '', ?, 0, ?, ?, ?)
+		ON CONFLICT (peer_id) DO UPDATE SET
+			last_seen      = excluded.last_seen,
+			last_converged = coalesce(excluded.last_converged, peers.last_converged),
+			last_error     = excluded.last_error,
+			last_vector    = coalesce(excluded.last_vector, peers.last_vector)`,
+		peerID, now, converged, lastErr, vec)
+	if err != nil {
+		return fmt.Errorf("store: record convergence: %w", err)
+	}
+	return nil
+}
+
 // Peers returns every peer this node knows about.
 func (db *DB) Peers(ctx context.Context) ([]Peer, error) {
-	rows, err := db.sql.QueryContext(ctx,
-		`SELECT peer_id, addrs, coalesce(last_seen, ''), static FROM peers ORDER BY peer_id`)
+	rows, err := db.sql.QueryContext(ctx, `
+		SELECT peer_id, addrs, coalesce(last_seen, ''), static,
+		       coalesce(last_converged, ''), coalesce(last_error, ''),
+		       coalesce(last_vector, '')
+		  FROM peers ORDER BY peer_id`)
 	if err != nil {
 		return nil, fmt.Errorf("store: read peers: %w", err)
 	}
@@ -447,7 +502,8 @@ func (db *DB) Peers(ctx context.Context) ([]Peer, error) {
 		var p Peer
 		var addrs string
 		var static int
-		if err := rows.Scan(&p.ID, &addrs, &p.LastSeen, &static); err != nil {
+		if err := rows.Scan(&p.ID, &addrs, &p.LastSeen, &static,
+			&p.LastConverged, &p.LastError, &p.LastVector); err != nil {
 			return nil, fmt.Errorf("store: scan peer: %w", err)
 		}
 		if addrs != "" {

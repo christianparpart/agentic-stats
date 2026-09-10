@@ -7,12 +7,15 @@ package mesh
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"net"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -218,7 +221,7 @@ func (m *Mesh) seedStaticPeers(ctx context.Context) error {
 		// A configured peer's node id is unknown until it answers, so the
 		// address doubles as its provisional identity.
 		if err := m.cfg.Store.SavePeer(ctx, store.Peer{
-			ID: "static:" + addr, Addrs: []string{addr}, Static: true,
+			ID: staticPrefix + addr, Addrs: []string{addr}, Static: true,
 		}); err != nil {
 			return err
 		}
@@ -355,6 +358,7 @@ func (m *Mesh) exchange(ctx context.Context, conn *channel.Conn, label string) {
 	}
 
 	stats, err := m.syncer.Exchange(ctx, conn, conn.PeerNodeID)
+	m.recordOutcome(conn.PeerNodeID, stats.PeerVector, err)
 	if err != nil {
 		m.log.Warn("exchange failed", "peer", conn.PeerNodeID, "via", label, "error", err)
 		return
@@ -374,6 +378,33 @@ func (m *Mesh) exchange(ctx context.Context, conn *channel.Conn, label string) {
 		}); err != nil {
 			m.log.Debug("record peer", "peer", conn.PeerNodeID, "error", err)
 		}
+	}
+}
+
+// recordOutcome persists whether this exchange actually converged.
+//
+// Written on failure as well as success. A peer that announces itself on the
+// network every thirty seconds while every exchange with it fails would
+// otherwise show up as recently seen and perfectly healthy, which is the
+// failure mode most worth catching: the mesh looks fine and is not replicating.
+//
+// Its own context, because the exchange context is very often already cancelled
+// by the time we get here -- that being why the exchange failed -- and the
+// record of the failure is the thing we least want to lose to it.
+func (m *Mesh) recordOutcome(peerID string, vector store.VersionVector, cause error) {
+	if peerID == "" {
+		return
+	}
+	encoded := ""
+	if len(vector) > 0 {
+		if b, err := json.Marshal(vector); err == nil {
+			encoded = string(b)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := m.cfg.Store.RecordConvergence(ctx, peerID, encoded, cause); err != nil {
+		m.log.Debug("record convergence", "peer", peerID, "error", err)
 	}
 }
 
@@ -414,11 +445,70 @@ func (m *Mesh) inBackoff(addr string) bool {
 	return ok && time.Now().Before(until)
 }
 
+// staticPrefix marks a configured address whose node id is not yet known.
+const staticPrefix = "static:"
+
 // KnownPeers reports what this node knows, for `status`.
 func (m *Mesh) KnownPeers(ctx context.Context) ([]store.Peer, error) {
 	peers, err := m.cfg.Store.Peers(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("mesh: read peers: %w", err)
 	}
-	return slices.DeleteFunc(peers, func(p store.Peer) bool { return p.ID == m.nodeID }), nil
+	peers = slices.DeleteFunc(peers, func(p store.Peer) bool { return p.ID == m.nodeID })
+	return withoutRedundantPlaceholders(peers), nil
+}
+
+// withoutRedundantPlaceholders drops a configured address once the machine
+// behind it has introduced itself.
+//
+// A peer listed in mesh.peers is recorded under "static:<addr>" because its
+// node id is unknown until it answers. Once it does, it is recorded again under
+// its real identity, and the placeholder lingers -- one machine appearing twice,
+// the second copy permanently reading as never converged. That is exactly the
+// shape of a real problem, so leaving it in a health report would teach the
+// reader to ignore the thing the report exists to show them.
+//
+// The placeholder is kept while the peer has genuinely never answered, because
+// then it is the only evidence the address was configured at all.
+func withoutRedundantPlaceholders(peers []store.Peer) []store.Peer {
+	answered := make(map[string]struct{})
+	for _, p := range peers {
+		if strings.HasPrefix(p.ID, staticPrefix) {
+			continue
+		}
+		for _, a := range p.Addrs {
+			answered[a] = struct{}{}
+		}
+	}
+	return slices.DeleteFunc(peers, func(p store.Peer) bool {
+		if !strings.HasPrefix(p.ID, staticPrefix) {
+			return false
+		}
+		// Match on host, since the peer reports the ephemeral port it dialled
+		// from rather than the one it listens on.
+		for _, a := range p.Addrs {
+			if hostsOverlap(a, answered) {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// hostsOverlap reports whether addr's host has answered on any port.
+func hostsOverlap(addr string, answered map[string]struct{}) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	for a := range answered {
+		other, _, oerr := net.SplitHostPort(a)
+		if oerr != nil {
+			other = a
+		}
+		if other == host {
+			return true
+		}
+	}
+	return false
 }

@@ -6,6 +6,7 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/christianparpart/agentic-stats/internal/derive"
+	"github.com/christianparpart/agentic-stats/internal/mesh"
 	"github.com/christianparpart/agentic-stats/internal/seal"
 )
 
@@ -43,6 +45,12 @@ type Config struct {
 	Logger *slog.Logger
 	// Now supplies time. Zero uses the system clock.
 	Now func() time.Time
+	// Health reports convergence with peers. Zero disables /v1/health, which
+	// is correct for a node with no mesh configured.
+	//
+	// A function rather than the Mesh itself: the dashboard needs one report
+	// out of peering and has no business holding the thing that does it.
+	Health func(context.Context) (mesh.Health, error)
 }
 
 // Server routes and handles HTTP requests.
@@ -51,6 +59,7 @@ type Server struct {
 	keys   *seal.Keys
 	log    *slog.Logger
 	now    func() time.Time
+	health func(context.Context) (mesh.Health, error)
 
 	mu       sync.Mutex
 	sessions map[string]time.Time
@@ -77,6 +86,7 @@ func NewServer(cfg Config) (*Server, error) {
 		keys:     cfg.Keys,
 		log:      log,
 		now:      now,
+		health:   cfg.Health,
 		sessions: make(map[string]time.Time),
 	}, nil
 }
@@ -85,9 +95,14 @@ func NewServer(cfg Config) (*Server, error) {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", s.handleDashboard)
-	mux.HandleFunc("GET /healthz", s.handleHealth)
+	mux.HandleFunc("GET /healthz", s.handleLiveness)
 	mux.HandleFunc("POST /v1/login", s.handleLogin)
 	mux.HandleFunc("POST /v1/logout", s.handleLogout)
+	// Behind authentication on purpose. /healthz stays a bare liveness check
+	// because a node bound off loopback answers it to anyone; this reports peer
+	// identities, addresses and how far behind each one is, which is a map of
+	// the fleet and not something to hand out.
+	mux.HandleFunc("GET /v1/health", s.authenticated(s.handleHealth))
 	mux.HandleFunc("GET /v1/summary", s.authenticated(s.handleSummary))
 	mux.HandleFunc("GET /v1/daily", s.authenticated(s.handleDaily))
 	mux.HandleFunc("GET /v1/delivery", s.authenticated(s.handleDelivery))
@@ -121,7 +136,11 @@ func (s *Server) validSession(token string) bool {
 	return true
 }
 
-func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+// handleLiveness answers "is this process up" and nothing more.
+//
+// Deliberately uninformative: a node bound off loopback answers this to
+// anyone, so it must not leak whether peering works or who the peers are.
+func (s *Server) handleLiveness(w http.ResponseWriter, _ *http.Request) {
 	s.respond(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -204,6 +223,61 @@ func (s *Server) queryFailed(w http.ResponseWriter, r *http.Request, op, msg str
 	s.fail(w, http.StatusInternalServerError, msg)
 }
 
+// handleHealth reports whether this node is actually converging with its peers.
+//
+// Always 200 when the node itself is working, with the verdict in the body. A
+// peer being switched off is the normal state of a laptop and must not read as
+// a failure -- if this returned non-200 for that, the signal would be ignored
+// within a week and would then be useless for the case that matters.
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if s.health == nil {
+		// Peering is disabled on this node. Saying so beats a 404, which a
+		// caller cannot tell apart from an old build.
+		s.respond(w, http.StatusOK, map[string]any{
+			"status": statusNoPeering,
+			"reason": "this node has no mesh configured",
+		})
+		return
+	}
+	report, err := s.health(r.Context())
+	if err != nil {
+		s.queryFailed(w, r, "health", "health failed", err)
+		return
+	}
+	s.respond(w, http.StatusOK, map[string]any{
+		"status": verdict(report),
+		"health": report,
+	})
+}
+
+// nodeStatus is the one-word verdict a monitor can alert on.
+type nodeStatus string
+
+const (
+	statusOK        nodeStatus = "ok"
+	statusDegraded  nodeStatus = "degraded"
+	statusNoPeering nodeStatus = "no-peering"
+)
+
+// verdict reduces the report to something worth alerting on.
+//
+// Quarantined records mean two machines are issuing under one origin id, which
+// is silent data loss and always degraded. A peer that is failing after having
+// worked is degraded too. A peer that has simply never been reached is not:
+// that is an address someone configured for a machine they have not switched on
+// yet, and calling it degraded would make the whole signal noise.
+func verdict(h mesh.Health) nodeStatus {
+	if h.Quarantined > 0 {
+		return statusDegraded
+	}
+	for _, p := range h.Peers {
+		if p.Reach == mesh.ReachFailing || p.Reach == mesh.ReachStale {
+			return statusDegraded
+		}
+	}
+	return statusOK
+}
+
 func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 	summary, err := s.derive.Summarize(r.Context())
 	if err != nil {
@@ -266,6 +340,6 @@ func (s *Server) fail(w http.ResponseWriter, status int, message string) {
 func Describe() string {
 	return "routes: " + strings.Join([]string{
 		"GET /", "GET /healthz", "POST /v1/login", "POST /v1/logout",
-		"GET /v1/summary", "GET /v1/daily", "GET /v1/delivery",
+		"GET /v1/health", "GET /v1/summary", "GET /v1/daily", "GET /v1/delivery",
 	}, ", ")
 }
