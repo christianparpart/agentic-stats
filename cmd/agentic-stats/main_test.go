@@ -93,3 +93,39 @@ func TestPeerLabelNamesAPeerWithoutLosingItsOriginID(t *testing.T) {
 		})
 	}
 }
+
+// Reporting the build must not depend on the environment.
+//
+// `version` is what an installer or a "is this node behind?" probe runs first,
+// and it needs nothing from the config directory. os.UserConfigDir fails on
+// Linux with neither $XDG_CONFIG_HOME nor $HOME set -- a minimal container, or
+// a unit file without Environment=HOME= -- and an exit 1 there reads as a
+// broken binary rather than a missing variable.
+func TestVersionNeedsNoConfigDirectory(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", "")
+	t.Setenv("AppData", "")
+
+	for _, spelling := range []string{"version", "--version"} {
+		t.Run(spelling, func(t *testing.T) {
+			if err := run([]string{spelling}); err != nil {
+				t.Errorf("run(%q) = %v, want it to report the build regardless", spelling, err)
+			}
+		})
+	}
+}
+
+// A command that does need the config path must still surface that failure
+// rather than inheriting the exemption above.
+func TestOtherCommandsStillReportAMissingConfigDirectory(t *testing.T) {
+	// os.UserConfigDir reads %AppData% on Windows and $XDG_CONFIG_HOME or
+	// $HOME elsewhere, and reports an error when the one it wants is empty --
+	// so clearing all three exercises the failure on every platform.
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", "")
+	t.Setenv("AppData", "")
+
+	if err := run([]string{"status"}); err == nil {
+		t.Error("run(status) succeeded with no config directory, want the resolution error")
+	}
+}

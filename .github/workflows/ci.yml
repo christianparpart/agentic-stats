@@ -106,6 +106,10 @@ jobs:
           - { goos: linux,   goarch: arm64 }
           - { goos: windows, goarch: amd64 }
     steps:
+      # Shallow, deliberately. This job compiles to /tmp and throws the result
+      # away, so the version it stamps is never read -- the link flags are
+      # exercised whatever the string says. Full history belongs in the job
+      # that publishes an artifact somebody installs.
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
         with:
@@ -119,7 +123,13 @@ jobs:
           CGO_ENABLED: "0"
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-        run: go build -trimpath -ldflags "-s -w" -o /tmp/ ./cmd/...
+        # Assigned on its own line first: a command substitution nested in a
+        # larger command does not trip `bash -e`, so a missing make or a
+        # renamed target would expand to nothing and silently produce the
+        # unstamped binary the ldflags target exists to prevent.
+        run: |
+          flags="$(make -s ldflags)"
+          go build -trimpath -ldflags "-s -w $flags" -o /tmp/ ./cmd/...
 
   secrets:
     name: Secret scan
