@@ -54,10 +54,33 @@ func (s scheduler) Uninstall() error {
 	return nil
 }
 
-func (s scheduler) Status() (Status, error) {
-	st := Status{DefinitionPath: `Task Scheduler\` + taskName}
+// presence says whether the scheduled task exists.
+//
+// A named type rather than an error, because "there is no task" is a state to
+// report and not a failure to report state -- schtasks simply exits non-zero
+// for it. Modelling it as an error meant Status returned a nil error on an
+// error path, which reads as a swallowed failure to both a linter and a person.
+type presence uint8
+
+const (
+	// taskAbsent is the zero value: nothing installed.
+	taskAbsent presence = iota
+	taskPresent
+)
+
+// queryTask returns the task definition, or reports that there is none.
+func queryTask() (string, presence) {
 	out, err := output("schtasks", "/Query", "/TN", taskName, "/FO", "LIST")
 	if err != nil {
+		return "", taskAbsent
+	}
+	return out, taskPresent
+}
+
+func (s scheduler) Status() (Status, error) {
+	st := Status{DefinitionPath: `Task Scheduler\` + taskName}
+	out, found := queryTask()
+	if found == taskAbsent {
 		st.Detail = "no scheduled task installed"
 		return st, nil
 	}

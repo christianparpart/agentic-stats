@@ -102,14 +102,3 @@ func (c Config) args() []string {
 	}
 	return args
 }
-
-// writeFile creates a definition file, making its directory first.
-func writeFile(path string, body []byte, perm os.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("service: create %s: %w", filepath.Dir(path), err)
-	}
-	if err := os.WriteFile(path, body, perm); err != nil {
-		return fmt.Errorf("service: write %s: %w", path, err)
-	}
-	return nil
-}

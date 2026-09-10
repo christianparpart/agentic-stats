@@ -141,7 +141,7 @@ func (c *Conn) Guard(ctx context.Context) (stop func()) {
 		case <-ctx.Done():
 			// A deadline in the past unblocks whatever is waiting, and Read and
 			// Write then report the context's cause rather than a bare timeout.
-			_ = c.Conn.SetDeadline(time.Now())
+			_ = c.SetDeadline(time.Now())
 		case <-done:
 		}
 	}()
@@ -150,7 +150,7 @@ func (c *Conn) Guard(ctx context.Context) (stop func()) {
 
 // Read refreshes the idle deadline and reads.
 func (c *Conn) Read(p []byte) (int, error) {
-	if err := c.before(c.Conn.SetReadDeadline); err != nil {
+	if err := c.before(c.SetReadDeadline); err != nil {
 		return 0, err
 	}
 	n, err := c.Conn.Read(p)
@@ -159,7 +159,7 @@ func (c *Conn) Read(p []byte) (int, error) {
 
 // Write refreshes the idle deadline and writes.
 func (c *Conn) Write(p []byte) (int, error) {
-	if err := c.before(c.Conn.SetWriteDeadline); err != nil {
+	if err := c.before(c.SetWriteDeadline); err != nil {
 		return 0, err
 	}
 	n, err := c.Conn.Write(p)

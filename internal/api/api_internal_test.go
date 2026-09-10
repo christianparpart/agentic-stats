@@ -60,7 +60,7 @@ func TestQueryFailedTellsAnAbandonedRequestFromAFault(t *testing.T) {
 			if tc.abandoned {
 				cancel()
 			}
-			r := httptest.NewRequest(http.MethodGet, "/v1/daily", nil).WithContext(ctx)
+			r := httptest.NewRequestWithContext(ctx, http.MethodGet, "/v1/daily", nil)
 			w := httptest.NewRecorder()
 
 			s.queryFailed(w, r, "daily", "daily failed", interrupted)

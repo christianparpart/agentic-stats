@@ -160,7 +160,7 @@ func TestAStalledHandshakeDoesNotBlockOtherPeers(t *testing.T) {
 	defer func() { _ = l.Close() }() // test cleanup
 
 	// A raw TCP connection that never starts TLS, held open for the duration.
-	stalled, err := net.Dial("tcp", l.Addr().String())
+	stalled, err := (&net.Dialer{}).DialContext(context.Background(), "tcp", l.Addr().String())
 	if err != nil {
 		t.Fatalf("dial stalled peer: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestTheListenerRecoversAfterABurstOfDeadConnections(t *testing.T) {
 	// Comfortably more raw connections than the cap, none of them handshaking.
 	var stalled []net.Conn
 	for range 128 {
-		c, derr := net.Dial("tcp", l.Addr().String())
+		c, derr := (&net.Dialer{}).DialContext(context.Background(), "tcp", l.Addr().String())
 		if derr != nil {
 			break
 		}
