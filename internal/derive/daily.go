@@ -17,6 +17,8 @@ type gridRow struct {
 	model    string
 	origin   string
 	session  string
+	cwd      string
+	branch   string
 	requests int64
 	output   int64
 	usage    pricing.Usage
@@ -34,6 +36,13 @@ type links struct {
 	// even split has a stable divisor and two nodes agree on it.
 	pullRequests map[string][]string
 	repos        map[string][]string
+	// projects maps a working directory to the project it belongs to, folded
+	// out of any worktree. Resolved once per distinct directory rather than per
+	// row: the grid holds a few thousand rows over a few dozen directories.
+	projects map[string]string
+	// byProject names each session by the one project it worked in, where it
+	// worked in only one.
+	byProject map[string]string
 }
 
 // names is everything needed to turn a key into something readable.
@@ -76,10 +85,26 @@ func stackings() []stacking {
 		{
 			stack: StackProject,
 			label: "Project",
-			note: "The repository a session's pull requests went to. Work that " +
-				"opened none is not attributed to a project rather than guessed at.",
+			note: "The directory each request ran in, from the record itself. " +
+				"Worktrees fold back into the project they came from -- the " +
+				"assistant's own exactly, and a sibling directory named after " +
+				"an issue by convention.",
 			divide: func(r gridRow, l links) []share {
-				return evenly(l.repos[r.session])
+				if p := l.projects[r.cwd]; p != "" {
+					return []share{{key: p, weight: 1}}
+				}
+				return []share{{key: NoneKey, weight: 1}}
+			},
+			name: func(key string, _ names) string { return key },
+		},
+		{
+			stack: StackBranch,
+			label: "Branch",
+			divide: func(r gridRow, _ links) []share {
+				if r.branch == "" {
+					return []share{{key: NoneKey, weight: 1}}
+				}
+				return []share{{key: r.branch, weight: 1}}
 			},
 			name: func(key string, _ names) string { return key },
 		},
@@ -166,21 +191,23 @@ func (s *Service) Daily(ctx context.Context) (Activity, error) {
 	// field should never serialise as null.
 	out := Activity{Days: []Day{}, Legends: []Legend{}}
 
-	l, err := s.sessionLinks(ctx)
-	if err != nil {
-		return Activity{}, err
-	}
-	n, err := s.segmentNames(ctx, l)
-	if err != nil {
-		return Activity{}, err
-	}
-
+	// The grid first: where a session's work went now includes which project
+	// its own rows ran in, and the grid is where those rows are.
 	grid, days, err := s.dailyGrid(ctx)
 	if err != nil {
 		return Activity{}, err
 	}
 	if len(days) == 0 {
 		return out, nil
+	}
+
+	l, err := s.sessionLinks(ctx, grid)
+	if err != nil {
+		return Activity{}, err
+	}
+	n, err := s.segmentNames(ctx, l)
+	if err != nil {
+		return Activity{}, err
 	}
 
 	// Per dimension: what each segment cost on each day, and overall.
@@ -289,7 +316,16 @@ func label(key string, st stacking, n names) string {
 	switch key {
 	case NoneKey:
 		switch st.stack {
-		case StackProject, StackPullRequest:
+		case StackProject:
+			// A record whose line carried no working directory. Distinct from
+			// "No pull request": most work opens no pull request, but almost
+			// none of it happened nowhere.
+			return "No project"
+		case StackBranch:
+			// An empty branch means unknown -- a detached HEAD, or a directory
+			// that is not a repository -- not a branch named HEAD.
+			return "No branch"
+		case StackPullRequest:
 			return "No pull request"
 		case StackSession:
 			return "No session"
@@ -349,6 +385,7 @@ func (s *Service) dailyGrid(ctx context.Context) ([]gridRow, []Day, error) {
 	for rows.Next() {
 		var r gridRow
 		if err := rows.Scan(&r.day, &r.model, &r.origin, &r.session,
+			&r.cwd, &r.branch,
 			&r.requests, &r.output,
 			&r.usage.Input, &r.usage.CacheRead,
 			&r.usage.CacheWrite5m, &r.usage.CacheWrite1h); err != nil {
@@ -380,8 +417,9 @@ func (s *Service) dailyGrid(ctx context.Context) ([]gridRow, []Day, error) {
 	return grid, days, nil
 }
 
-// sessionLinks reads what each session shipped.
-func (s *Service) sessionLinks(ctx context.Context) (links, error) {
+// sessionLinks gathers everything the archive knows about where each session's
+// work went: the pull requests it opened, and the project its records ran in.
+func (s *Service) sessionLinks(ctx context.Context, grid []gridRow) (links, error) {
 	rows, err := s.db.SQL().QueryContext(ctx, sessionLinksQuery)
 	if err != nil {
 		return links{}, fmt.Errorf("derive: session links: %w", err)
@@ -402,7 +440,13 @@ func (s *Service) sessionLinks(ctx context.Context) (links, error) {
 	if err := rows.Err(); err != nil {
 		return links{}, fmt.Errorf("derive: session links: %w", err)
 	}
-	return links{pullRequests: sorted(prs), repos: sorted(repos)}, nil
+	l := links{
+		pullRequests: sorted(prs),
+		repos:        sorted(repos),
+		projects:     s.projectsOf(grid),
+	}
+	l.byProject = sessionProjects(l, grid)
+	return l, nil
 }
 
 func add(m map[string]map[string]struct{}, key, value string) {
@@ -429,26 +473,68 @@ func sorted(m map[string]map[string]struct{}) map[string][]string {
 	return out
 }
 
+// projectsOf resolves each distinct working directory in the grid once.
+func (s *Service) projectsOf(grid []gridRow) map[string]string {
+	out := make(map[string]string)
+	for _, r := range grid {
+		if _, done := out[r.cwd]; done {
+			continue
+		}
+		out[r.cwd] = s.projects.of(r.cwd)
+	}
+	return out
+}
+
 // segmentNames gathers everything needed to label a segment.
 func (s *Service) segmentNames(ctx context.Context, l links) (names, error) {
 	peers, err := s.db.PeerNames(ctx)
 	if err != nil {
 		return names{}, fmt.Errorf("derive: peer names: %w", err)
 	}
-	n := names{
+	return names{
 		peers:   peers,
 		self:    s.db.OriginID(),
-		project: make(map[string]string, len(l.repos)),
-	}
-	for session, repos := range l.repos {
-		// A session that shipped to one repository is named by it. One that
-		// shipped to several has no single project, and saying so beats
-		// picking one.
-		if len(repos) == 1 {
-			n.project[session] = strings.TrimPrefix(repos[0], repoOwner(repos[0]))
+		project: l.byProject,
+	}, nil
+}
+
+// sessionProjects names each session by the project it worked in.
+//
+// From the working directory first, which nearly every session has, and from
+// the pull request it shipped only as a fallback -- the repository was the only
+// answer available before, and it is still the right one for a session whose
+// records somehow carry no directory.
+//
+// Either way, a session showing more than one answer gets none: saying nothing
+// beats picking one. That is a test of the set of values rather than of the
+// order they arrived in, so two replicas cannot disagree about it.
+func sessionProjects(l links, grid []gridRow) map[string]string {
+	found := make(map[string]map[string]struct{})
+	for _, r := range grid {
+		if r.session == "" {
+			continue
+		}
+		if p := l.projects[r.cwd]; p != "" {
+			add(found, r.session, p)
 		}
 	}
-	return n, nil
+
+	out := make(map[string]string, len(found)+len(l.repos))
+	for session, set := range found {
+		if len(set) != 1 {
+			continue
+		}
+		for p := range set {
+			out[session] = p
+		}
+	}
+	for session, repos := range l.repos {
+		if _, named := out[session]; named || len(repos) != 1 {
+			continue
+		}
+		out[session] = strings.TrimPrefix(repos[0], repoOwner(repos[0]))
+	}
+	return out
 }
 
 // repoOwner is the "owner/" prefix of a repository, which a session label

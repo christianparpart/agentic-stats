@@ -81,9 +81,11 @@ type Stack string
 const (
 	// StackModel divides by the model that answered.
 	StackModel Stack = "model"
-	// StackProject divides by the repository the session's pull requests went
-	// to, which is the only project identity the archive actually holds.
+	// StackProject divides by the project each request ran in, taken from the
+	// record's own working directory and folded back out of any worktree.
 	StackProject Stack = "project"
+	// StackBranch divides by the git branch checked out at the time.
+	StackBranch Stack = "branch"
 	// StackPullRequest divides by the pull request the session opened.
 	StackPullRequest Stack = "pull_request"
 	// StackSession divides by the assistant session.
@@ -166,21 +168,46 @@ type Activity struct {
 	Legends []Legend `json:"legends"`
 }
 
-// Service derives facts from the archive.
-type Service struct {
-	db     *store.DB
-	prices *pricing.Table
+// Config is everything a Service needs.
+type Config struct {
+	// Store is the archive to read. Required.
+	Store *store.DB
+	// Prices values the token counts. Required.
+	Prices *pricing.Table
+	// ProjectSuffixes are the directory-name suffixes that mark a sibling
+	// worktree, replacing DefaultProjectSuffixes rather than adding to them so
+	// a default that turns out to be wrong can be removed. Zero uses them.
+	//
+	// Injected but not configurable from the config file, and the distinction
+	// is deliberate. Configuration is per machine and nothing in the mesh
+	// exchanges it, so two nodes with different tables would render different
+	// project legends from identical archives -- permanently, and
+	// indistinguishably from real divergence. A code default has the same
+	// hazard only across binary versions, which is transient and already true
+	// of prices, labels and MaxSegments.
+	ProjectSuffixes []string
 }
 
-// NewService returns a Service backed by db and a price table.
-func NewService(db *store.DB, prices *pricing.Table) (*Service, error) {
-	if db == nil {
+// Service derives facts from the archive.
+type Service struct {
+	db       *store.DB
+	prices   *pricing.Table
+	projects projectRules
+}
+
+// NewService returns a Service backed by the archive and a price table.
+func NewService(cfg Config) (*Service, error) {
+	if cfg.Store == nil {
 		return nil, errors.New("derive: a database is required")
 	}
-	if prices == nil {
+	if cfg.Prices == nil {
 		return nil, errors.New("derive: a price table is required")
 	}
-	return &Service{db: db, prices: prices}, nil
+	projects, err := newProjectRules(cfg.ProjectSuffixes)
+	if err != nil {
+		return nil, err
+	}
+	return &Service{db: cfg.Store, prices: cfg.Prices, projects: projects}, nil
 }
 
 // foldedUsageCTE selects one row per API request.
@@ -209,6 +236,12 @@ WITH folded AS (
            -- rather than to both.
            origin_id,
            substr(coalesce(captured_at, ''), 1, 10) AS day,
+           -- The working directory and branch this request ran in. Bare
+           -- columns for the same reason and with the same guarantee as
+           -- origin_id: a request whose lines were written under two working
+           -- directories resolves to one of them deterministically, rather
+           -- than being counted under both.
+           cwd, git_branch,
            input_tokens, output_tokens, think_tokens,
            cache_read, cache_write5m, cache_write1h,
            min(origin_id || ':' || printf('%020d', seq)) AS pick
@@ -247,16 +280,24 @@ SELECT coalesce(model, 'unknown'),
 // and the session costs nothing but rows -- both are columns of `records_fold`
 // already -- and one query then answers every dimension the dashboard offers.
 //
+// The working directory and branch have to be in the GROUP BY and not merely
+// the SELECT. Inside the fold a bare column is well defined because it comes
+// from the row the single min() picked; out here there is no min(), so a bare
+// column would be an arbitrary row's value and two replicas could pick
+// differently. Grouping by them is also what makes the project division exact:
+// a row belongs to one project rather than being split between several.
+//
 // Around 1,200 rows on a 480k-record archive: a day has a handful of sessions,
 // each using a couple of models, on one machine.
 const dailyUsageQuery = foldedUsageCTE + `
 SELECT day, coalesce(model, 'unknown'), origin_id, coalesce(session_id, ''),
+       coalesce(cwd, ''), coalesce(git_branch, ''),
        count(*), sum(output_tokens),
        sum(input_tokens), sum(cache_read),
        sum(cache_write5m), sum(cache_write1h)
   FROM folded
  WHERE day <> ''
- GROUP BY day, model, origin_id, session_id
+ GROUP BY day, model, origin_id, session_id, cwd, git_branch
  ORDER BY day`
 
 // sessionLinksQuery names the pull requests each session opened.
