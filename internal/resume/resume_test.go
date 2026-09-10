@@ -2,6 +2,7 @@ package resume_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,11 +17,25 @@ const (
 // detector drives Watch by hand: the test decides both what time it is and when
 // the detector gets to look, so no assertion depends on real elapsed time.
 type detector struct {
+	// mu guards now.
+	//
+	// The tick handshake is not enough on its own: it orders the send against
+	// Watch *receiving*, but Watch reads the clock after that, and the test is
+	// already free to move on to the next elapse by then. The race detector
+	// caught exactly that.
+	mu    sync.Mutex
 	now   time.Time
 	tick  chan time.Time
 	woke  chan struct{}
 	stop  context.CancelFunc
 	ended chan struct{}
+}
+
+// clock is what Watch reads.
+func (d *detector) clock() time.Time {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.now
 }
 
 func start(t *testing.T) *detector {
@@ -38,9 +53,8 @@ func start(t *testing.T) *detector {
 		resume.Watch(ctx, resume.Config{
 			Interval:  interval,
 			Threshold: threshold,
-			// Read under the tick handshake below, never concurrently.
-			Clock: func() time.Time { return d.now },
-			Tick:  d.tick,
+			Clock:     d.clock,
+			Tick:      d.tick,
 		}, func() { d.woke <- struct{}{} })
 	}()
 	t.Cleanup(func() {
@@ -60,10 +74,12 @@ func start(t *testing.T) *detector {
 
 // elapse moves the clock and lets the detector look exactly once.
 //
-// The unbuffered tick is the handshake: the send returns only once Watch has
-// received it, so the clock is never written while Watch is reading it.
+// The unbuffered tick still sequences the observations -- one look per elapse --
+// while the mutex is what makes the clock itself safe to share.
 func (d *detector) elapse(by time.Duration) {
+	d.mu.Lock()
 	d.now = d.now.Add(by)
+	d.mu.Unlock()
 	d.tick <- time.Time{}
 }
 
