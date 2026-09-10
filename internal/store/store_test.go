@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -283,5 +284,40 @@ func TestSinceIsOrderedAndBounded(t *testing.T) {
 func TestOpenRequiresAPath(t *testing.T) {
 	if _, err := store.Open(context.Background(), store.Config{}); err == nil {
 		t.Error("expected an error when Path is empty")
+	}
+}
+
+// The write-ahead log must be bounded, on every connection.
+//
+// A reader that will not finish keeps a checkpoint from resetting the log, and
+// every write meanwhile extends it: this node reached 263 MB that way and kept
+// it, because SQLite reuses that space but never returns it. The limit is what
+// makes the next good checkpoint give it back, and it is per connection -- the
+// pool opens more on demand, and one unconfigured connection is enough to let
+// the file grow again.
+func TestEveryConnectionBoundsTheWriteAheadLog(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+
+	// Hold several connections open at once so the pool has to make new ones,
+	// then check the limit on each.
+	var held []*sql.Conn
+	for range 4 {
+		conn, err := db.SQL().Conn(ctx)
+		if err != nil {
+			t.Fatalf("Conn: %v", err)
+		}
+		defer func() { _ = conn.Close() }() // test cleanup
+		held = append(held, conn)
+	}
+	for i, conn := range held {
+		var limit int64
+		if err := conn.QueryRowContext(ctx, `PRAGMA journal_size_limit`).Scan(&limit); err != nil {
+			t.Fatalf("connection %d: read journal_size_limit: %v", i, err)
+		}
+		if limit != store.MaxJournalBytes {
+			t.Errorf("connection %d caps its write-ahead log at %d bytes, want %d",
+				i, limit, store.MaxJournalBytes)
+		}
 	}
 }

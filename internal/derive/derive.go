@@ -125,6 +125,96 @@ WITH folded AS (
      GROUP BY request_id
 )`
 
+// The reports the dashboard asks for, as constants rather than string literals
+// inside their methods.
+//
+// They are here because their cost is a property of the schema, not of the Go
+// around them: each one is only fast while `records_fold` still carries every
+// column the fold reads, and the moment one of them asks for a column the
+// index does not have, the fold goes back to fetching whole rows -- sealed
+// bodies and all -- out of a multi-gigabyte table. Gathering them makes that
+// checkable, and planTest walks exactly this list.
+
+// modelUsageQuery totals the fold per model, biggest producer first.
+const modelUsageQuery = foldedUsageCTE + `
+SELECT coalesce(model, 'unknown'),
+       count(*),
+       sum(input_tokens), sum(output_tokens),
+       sum(cache_read), sum(cache_write5m), sum(cache_write1h),
+       sum(think_tokens)
+  FROM folded
+ GROUP BY model
+ ORDER BY sum(output_tokens) DESC`
+
+// dailyUsageQuery totals the fold per day and model, oldest first.
+const dailyUsageQuery = foldedUsageCTE + `
+SELECT day, coalesce(model, 'unknown'), count(*), sum(output_tokens),
+       sum(input_tokens), sum(cache_read),
+       sum(cache_write5m), sum(cache_write1h)
+  FROM folded
+ WHERE day <> ''
+ GROUP BY day, model
+ ORDER BY day`
+
+// deliveriesQuery splits each session's usage between the pull requests it
+// produced, one row per (pull request, model).
+const deliveriesQuery = foldedUsageCTE + `,
+-- Totalled per session before the join rather than after it.
+--
+-- Every term below is a sum or a count, and the divisor is fixed for a
+-- session, so summing within the session first and joining the totals gives
+-- the same answer as joining first -- but over a few hundred rows instead of
+-- one per request. Joining first made the planner build the pull-request side
+-- into an ephemeral index and probe it once per folded request: 23 seconds on
+-- a 480k-record archive, against 0.3 for this.
+per_session AS (
+    SELECT session_id, model,
+           count(*)           AS requests,
+           sum(input_tokens)  AS input_tokens,
+           sum(output_tokens) AS output_tokens,
+           sum(cache_read)    AS cache_read,
+           sum(cache_write5m) AS cache_write5m,
+           sum(cache_write1h) AS cache_write1h
+      FROM folded
+     WHERE session_id IS NOT NULL
+     GROUP BY session_id, model
+),
+links AS (
+    SELECT DISTINCT session_id, pr_repo, pr_number
+      FROM records
+     WHERE pr_repo IS NOT NULL AND session_id IS NOT NULL
+),
+-- How many pull requests each session produced, which is the divisor.
+weights AS (
+    SELECT session_id, count(*) AS pr_count FROM links GROUP BY session_id
+)
+SELECT l.pr_repo, l.pr_number,
+       coalesce(s.model, 'unknown'),
+       sum(s.requests),
+       -- links holds each (session, pull request) once, so one row here is
+       -- one session and counting rows counts distinct sessions.
+       count(*),
+       sum(CASE WHEN w.pr_count > 1 THEN s.requests ELSE 0 END),
+       sum(s.output_tokens),
+       sum(CAST(s.input_tokens   AS REAL) / w.pr_count),
+       sum(CAST(s.output_tokens  AS REAL) / w.pr_count),
+       sum(CAST(s.cache_read     AS REAL) / w.pr_count),
+       sum(CAST(s.cache_write5m  AS REAL) / w.pr_count),
+       sum(CAST(s.cache_write1h  AS REAL) / w.pr_count)
+  FROM per_session s
+  JOIN links   l ON l.session_id = s.session_id
+  JOIN weights w ON w.session_id = s.session_id
+ GROUP BY l.pr_repo, l.pr_number, s.model`
+
+// attributionQuery counts folded requests belonging to a session that shipped
+// a pull request, against all folded requests.
+const attributionQuery = foldedUsageCTE + `
+SELECT coalesce(sum(CASE WHEN session_id IN (
+           SELECT session_id FROM records WHERE pr_repo IS NOT NULL
+       ) THEN 1 ELSE 0 END), 0),
+       count(*)
+  FROM folded`
+
 // Summarize computes the whole-archive summary.
 func (s *Service) Summarize(ctx context.Context) (Summary, error) {
 	// Empty rather than nil, so an archive with nothing in it serialises as []
@@ -142,15 +232,7 @@ func (s *Service) Summarize(ctx context.Context) (Summary, error) {
 		return Summary{}, fmt.Errorf("derive: count assistant lines: %w", err)
 	}
 
-	rows, err := db.QueryContext(ctx, foldedUsageCTE+`
-		SELECT coalesce(model, 'unknown'),
-		       count(*),
-		       sum(input_tokens), sum(output_tokens),
-		       sum(cache_read), sum(cache_write5m), sum(cache_write1h),
-		       sum(think_tokens)
-		  FROM folded
-		 GROUP BY model
-		 ORDER BY sum(output_tokens) DESC`)
+	rows, err := db.QueryContext(ctx, modelUsageQuery)
 	if err != nil {
 		return Summary{}, fmt.Errorf("derive: summarize by model: %w", err)
 	}
@@ -175,14 +257,7 @@ func (s *Service) Summarize(ctx context.Context) (Summary, error) {
 
 // Daily returns per-day activity, oldest first.
 func (s *Service) Daily(ctx context.Context) ([]Day, error) {
-	rows, err := s.db.SQL().QueryContext(ctx, foldedUsageCTE+`
-		SELECT day, coalesce(model, 'unknown'), count(*), sum(output_tokens),
-		       sum(input_tokens), sum(cache_read),
-		       sum(cache_write5m), sum(cache_write1h)
-		  FROM folded
-		 WHERE day <> ''
-		 GROUP BY day, model
-		 ORDER BY day`)
+	rows, err := s.db.SQL().QueryContext(ctx, dailyUsageQuery)
 	if err != nil {
 		return nil, fmt.Errorf("derive: daily: %w", err)
 	}
@@ -271,31 +346,7 @@ func (s *Service) Deliveries(ctx context.Context) (Delivery, error) {
 	// field should never serialise as null.
 	out := Delivery{PullRequests: []PullRequest{}}
 
-	rows, err := s.db.SQL().QueryContext(ctx, foldedUsageCTE+`,
-links AS (
-    SELECT DISTINCT session_id, pr_repo, pr_number
-      FROM records
-     WHERE pr_repo IS NOT NULL AND session_id IS NOT NULL
-),
--- How many pull requests each session produced, which is the divisor.
-weights AS (
-    SELECT session_id, count(*) AS pr_count FROM links GROUP BY session_id
-)
-SELECT l.pr_repo, l.pr_number,
-       coalesce(f.model, 'unknown'),
-       count(*),
-       count(DISTINCT f.session_id),
-       sum(CASE WHEN w.pr_count > 1 THEN 1 ELSE 0 END),
-       sum(f.output_tokens),
-       sum(CAST(f.input_tokens   AS REAL) / w.pr_count),
-       sum(CAST(f.output_tokens  AS REAL) / w.pr_count),
-       sum(CAST(f.cache_read     AS REAL) / w.pr_count),
-       sum(CAST(f.cache_write5m  AS REAL) / w.pr_count),
-       sum(CAST(f.cache_write1h  AS REAL) / w.pr_count)
-  FROM folded f
-  JOIN links   l ON l.session_id = f.session_id
-  JOIN weights w ON w.session_id = f.session_id
- GROUP BY l.pr_repo, l.pr_number, f.model`)
+	rows, err := s.db.SQL().QueryContext(ctx, deliveriesQuery)
 	if err != nil {
 		return Delivery{}, fmt.Errorf("derive: deliveries: %w", err)
 	}
@@ -347,15 +398,18 @@ SELECT l.pr_repo, l.pr_number,
 		return out.PullRequests[i].CostUSD > out.PullRequests[j].CostUSD
 	})
 
-	// Counted on distinct requests, so a session opening several pull requests
+	// Counted on the fold, so a session opening several pull requests
 	// contributes once rather than once per pull request.
+	//
+	// Over the fold rather than over raw lines, because the two do not always
+	// agree: 80 requests in a 480k-record archive have lines under more than
+	// one session id, and counting lines called every one of them attributed
+	// if any of its sessions shipped a pull request -- while the table above
+	// bills each to the single session the fold picked. The ratio has to
+	// describe the same attribution the table performed, or it is measuring
+	// nothing. It is also the difference between 12 seconds and 0.2.
 	var attributed, total int64
-	row := s.db.SQL().QueryRowContext(ctx, `
-		SELECT
-		  (SELECT count(DISTINCT request_id) FROM records
-		    WHERE request_id IS NOT NULL
-		      AND session_id IN (SELECT session_id FROM records WHERE pr_repo IS NOT NULL)),
-		  (SELECT count(DISTINCT request_id) FROM records WHERE request_id IS NOT NULL)`)
+	row := s.db.SQL().QueryRowContext(ctx, attributionQuery)
 	if err := row.Scan(&attributed, &total); err != nil {
 		return Delivery{}, fmt.Errorf("derive: count attributed requests: %w", err)
 	}

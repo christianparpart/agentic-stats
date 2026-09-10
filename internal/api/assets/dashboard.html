@@ -149,10 +149,36 @@
   .primary:disabled:hover { filter: none; }
   .hidden { display: none !important; }
   .empty { color: var(--text-secondary); font-size: 13px; padding: 8px 0 16px; }
+
+  /* --- waiting ---
+     A node holding a few hundred thousand lines takes a moment to answer, and
+     until it does there is nothing to draw. Saying so is the difference
+     between a slow page and a broken one. */
+  .waiting { color: var(--text-secondary); font-size: 13px; padding: 10px 0 18px; }
+  .waiting::after {
+    content: ""; display: inline-block; width: 6px; height: 6px; margin-left: 8px;
+    border-radius: 50%; background: currentColor; vertical-align: middle;
+    animation: pulse 1.1s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%, 100% { opacity: .25; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .waiting::after { animation: none; opacity: .6; } }
+  .failed { color: var(--critical); font-size: 13px; padding: 10px 0 18px; }
 </style>
 </head>
 <body>
 <div id="tip" role="status" aria-live="polite"></div>
+
+<!-- Opening state. Visible from the first paint: the page cannot yet know
+     whether this browser has a session, and finding out means asking the
+     archive. Starting with everything hidden showed a blank window for as
+     long as that took. -->
+<section id="booting" class="login">
+  <div class="card">
+    <h2>agentic-stats</h2>
+    <p class="cap waiting" id="booting-note">Reading this node&rsquo;s archive</p>
+    <button class="primary hidden" id="retry" type="button">Try again</button>
+  </div>
+</section>
 
 <!-- Login -->
 <section id="login" class="login hidden">
@@ -418,35 +444,101 @@ async function api(path, opts) {
   return r.json();
 }
 
-let lastData = null;
+/* The page is in exactly one of three states, and something is always
+   visible. Tracked in a variable rather than read back off the DOM, because
+   a report that fails with 401 puts the login up from inside api() while the
+   other two are still in flight, and their handlers must not undo it. */
+let state = "booting";
+function showOnly(next) {
+  state = next;
+  for (const id of ["booting", "login", "app"]) {
+    document.getElementById(id).classList.toggle("hidden", id !== next);
+  }
+}
+function showLogin() { showOnly("login"); }
+
+let lastData = {summary: null, daily: null, delivery: null};
+let failed = {};
+
+/* Three requests, drawn as each one lands.
+   The reports do not cost the same to answer and the archive only grows, so
+   waiting for all three before drawing any let the slowest decide when the
+   page appeared -- and one failure left the whole window blank. */
 async function load() {
-  const [summary, daily, delivery] = await Promise.all([
-    api("/v1/summary"), api("/v1/daily"), api("/v1/delivery"),
+  if (state === "booting") bootNote("Reading this node&rsquo;s archive", "waiting");
+  lastData = {summary: null, daily: null, delivery: null};
+  failed = {};
+
+  const fetchInto = (key, path) => api(path).then(data => {
+    lastData[key] = data;
+    // The first report to arrive is enough to put the dashboard up; the rest
+    // fill in behind it.
+    if (state !== "app") showOnly("app");
+    render();
+  }, err => {
+    // Deliberately no state change: while nothing has succeeded the honest
+    // thing on screen is still "reading", and the last of the three decides
+    // what to say if none of them ever does.
+    failed[key] = err;
+    render();
+    throw err;
+  });
+
+  const results = await Promise.allSettled([
+    fetchInto("summary", "/v1/summary"),
+    fetchInto("daily", "/v1/daily"),
+    fetchInto("delivery", "/v1/delivery"),
   ]);
-  lastData = {summary, daily, delivery};
-  document.getElementById("login").classList.add("hidden");
-  document.getElementById("app").classList.remove("hidden");
-  render();
+  if (results.every(r => r.status === "rejected") && state === "booting") {
+    // A 401 has already moved to the login form, and a failure during sign-in
+    // is reported on that form. Reaching here means neither: this node has
+    // trouble of its own, and hiding it behind a sign-in box that cannot help
+    // is how a broken node looks like a blank page.
+    bootNote("This node did not answer. It may still be starting up.", "failed");
+    document.getElementById("retry").classList.remove("hidden");
+  }
+  if (results.every(r => r.status === "rejected")) throw results[0].reason;
+}
+
+function bootNote(html, kind) {
+  const note = document.getElementById("booting-note");
+  note.className = "cap " + kind;
+  note.innerHTML = html;
 }
 
 function render() {
-  if (!lastData) return;
   const {summary, daily, delivery} = lastData;
-  tiles(summary);
-  document.getElementById("scope").textContent =
-    `${fmtInt(summary.lines)} archived lines · ${daily.days.length} active days`;
-  // A field the server sends as a list can still arrive null from an older
-  // node in the mesh -- every node serves its own dashboard, and they are not
-  // upgraded together. deliveryView already defends itself the same way.
-  dailyChart(document.getElementById("daily"), daily.days || []);
-  modelChart(document.getElementById("models"), summary.models || []);
-  modelTable(summary.models || []);
-  deliveryView(delivery);
+  const scope = document.getElementById("scope");
+
+  if (summary) {
+    tiles(summary);
+    // A field the server sends as a list can still arrive null from an older
+    // node in the mesh -- every node serves its own dashboard, and they are
+    // not upgraded together. deliveryView defends itself the same way.
+    modelChart(document.getElementById("models"), summary.models || []);
+    modelTable(summary.models || []);
+    scope.textContent = `${fmtInt(summary.lines)} archived lines` +
+      (daily ? ` · ${(daily.days || []).length} active days` : "");
+  } else {
+    pending(document.getElementById("tiles"), failed.summary, "the summary");
+    pending(document.getElementById("models"), failed.summary, "the summary");
+    document.querySelector("#model-table tbody").innerHTML = "";
+    scope.textContent = "";
+  }
+
+  if (daily) dailyChart(document.getElementById("daily"), daily.days || []);
+  else pending(document.getElementById("daily"), failed.daily, "the daily breakdown");
+
+  if (delivery) deliveryView(delivery);
+  else pending(document.getElementById("delivery"), failed.delivery, "pull requests");
 }
 
-function showLogin() {
-  document.getElementById("app").classList.add("hidden");
-  document.getElementById("login").classList.remove("hidden");
+// pending fills a panel that has nothing to draw yet, so a slow or broken
+// report reads as one panel waiting rather than a page that failed to load.
+function pending(host, failure, what) {
+  host.innerHTML = failure
+    ? `<p class="failed">Could not read ${what} from this node.</p>`
+    : `<p class="waiting">Reading ${what}</p>`;
 }
 
 document.getElementById("login-form").addEventListener("submit", async e => {
@@ -490,6 +582,11 @@ document.getElementById("login-form").addEventListener("submit", async e => {
   }
 });
 
+document.getElementById("retry").addEventListener("click", () => {
+  document.getElementById("retry").classList.add("hidden");
+  load().catch(() => {});
+});
+
 document.getElementById("logout").addEventListener("click", async () => {
   await fetch("/v1/logout", {method: "POST", credentials: "same-origin"});
   showLogin();
@@ -504,7 +601,9 @@ document.getElementById("theme").addEventListener("click", () => {
 
 addEventListener("resize", () => { clearTimeout(window._rt); window._rt = setTimeout(render, 120); });
 
-load().catch(() => showLogin());
+// load decides for itself between the dashboard, the sign-in form and an
+// explained failure, so there is nothing left to do with the rejection here.
+load().catch(() => {});
 </script>
 </body>
 </html>

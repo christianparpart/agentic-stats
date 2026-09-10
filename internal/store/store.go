@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io/fs"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -22,6 +23,20 @@ import (
 
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
+
+// MaxJournalBytes caps the write-ahead log left behind after a checkpoint.
+//
+// A WAL is only reset once a checkpoint finds no reader still standing on it,
+// so a slow query holds it open and every write in the meantime extends it.
+// This node's dashboard used to hold 45-second read transactions and grew one
+// to 263 MB, which it then kept forever: SQLite reuses the space but never
+// gives it back on its own.
+//
+// The limit makes that self-correcting -- the next successful checkpoint
+// truncates the file to here -- so one slow reader costs a spike rather than a
+// permanent quarter-gigabyte. It is not a cure for a starved checkpoint, only
+// a bound on the damage; the cure is queries that finish.
+const MaxJournalBytes = 64 << 20
 
 // Config is everything a DB needs.
 type Config struct {
@@ -64,7 +79,8 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		"?_pragma=journal_mode(WAL)" +
 		"&_pragma=synchronous(NORMAL)" +
 		"&_pragma=busy_timeout(10000)" +
-		"&_pragma=foreign_keys(ON)"
+		"&_pragma=foreign_keys(ON)" +
+		"&_pragma=journal_size_limit(" + strconv.Itoa(MaxJournalBytes) + ")"
 
 	handle, err := sql.Open("sqlite3", dsn)
 	if err != nil {

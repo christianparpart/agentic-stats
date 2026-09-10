@@ -281,12 +281,60 @@ func prLink(session, repo string, number int) string {
 
 // sessionLine is an assistant response belonging to a named session.
 func sessionLine(session, requestID string, output int64) string {
+	return sessionLineWithUUID(session, requestID, requestID+"-u", output)
+}
+
+// sessionLineWithUUID is sessionLine with the line's own identity supplied, so
+// a test can put two lines of the same request under different sessions.
+func sessionLineWithUUID(session, requestID, uuid string, output int64) string {
 	return fmt.Sprintf(`{"type":"assistant","requestId":%q,"uuid":%q,"sessionId":%q,`+
 		`"timestamp":"2026-09-08T12:00:00.000Z","message":{"model":"claude-opus-5",`+
 		`"usage":{"input_tokens":10,"output_tokens":%d,"cache_read_input_tokens":100,`+
 		`"output_tokens_details":{"thinking_tokens":5},`+
 		`"cache_creation":{"ephemeral_5m_input_tokens":10,"ephemeral_1h_input_tokens":0}}}}`,
-		requestID, requestID+"-u", session, output)
+		requestID, uuid, session, output)
+}
+
+// When a request's lines disagree about which session they belong to, the
+// attributed share must follow the fold -- the same single line the cost is
+// billed through -- and not count the request because some other line of it
+// mentioned a session that shipped.
+//
+// This is not hypothetical: 80 requests in a 480k-record archive have lines
+// under more than one session id. Counting lines made the ratio describe an
+// attribution the table did not perform, which is a number that means nothing.
+func TestAttributionFollowsTheFold(t *testing.T) {
+	n := newNode(t)
+	ctx := context.Background()
+
+	if _, err := n.writer.Ingest(ctx, records(
+		// The fold takes the lowest (origin, seq), so this request belongs to
+		// the session that shipped nothing -- even though its second line
+		// names the one that did.
+		sessionLineWithUUID("no-pull-request", "req-split", "split-a", 100),
+		sessionLineWithUUID("shipped", "req-split", "split-b", 100),
+		sessionLine("shipped", "req-shipped", 100),
+		prLink("shipped", "acme/widgets", 7),
+	)); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+
+	d, err := n.derive.Deliveries(ctx)
+	if err != nil {
+		t.Fatalf("Deliveries: %v", err)
+	}
+	if len(d.PullRequests) != 1 {
+		t.Fatalf("attributed %d pull requests, want 1", len(d.PullRequests))
+	}
+	// One of the two folded requests is billed to the pull request...
+	if got := d.PullRequests[0].Requests; got != 1 {
+		t.Errorf("pull request billed %d requests, want 1", got)
+	}
+	// ...so exactly half of the archive's requests are attributed. Counting
+	// lines instead would say all of them.
+	if got := d.Attributed; got < 0.5-1e-9 || got > 0.5+1e-9 {
+		t.Errorf("attributed share = %.3f, want 0.5", got)
+	}
 }
 
 // A session that opens several pull requests must have its cost split between
