@@ -1,0 +1,19 @@
+{
+  "SessionID": "sess-0002",
+  "LineUUID": "",
+  "CapturedAt": "",
+  "RequestID": "",
+  "Model": "",
+  "PRRepo": "",
+  "PRNumber": 0,
+  "CWD": "",
+  "GitBranch": "",
+  "Usage": {
+    "Input": 0,
+    "Output": 0,
+    "Thinking": 0,
+    "CacheRead": 0,
+    "CacheWrite5m": 0,
+    "CacheWrite1h": 0
+  }
+}

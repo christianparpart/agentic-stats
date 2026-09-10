@@ -64,6 +64,17 @@ type announcement struct {
 // by something that captures it. Base64 costs a third more bytes than a binary
 // framing would; ciphertext does not compress, so the saving from a binary
 // encoding would be the JSON overhead alone and is not worth a second codec.
+//
+// Every field of store.Record must appear here. The pull-request columns did
+// not for a long time, so no pull request a session opened on one machine was
+// ever visible on another: the receiver stored the record with pr_repo NULL and
+// the delivery report simply had nothing to join against. Nothing failed and
+// nothing was logged, which is why sync_test asserts this by reflection over
+// store.Record rather than by anyone remembering to add a field twice.
+//
+// Adding a field is compatible in both directions: an old node ignores what it
+// does not know, and a field a peer never sent decodes to its zero value, which
+// the receiving node's own reprocessor then fills in from the sealed body.
 type wireRecord struct {
 	OriginID     string `json:"o"`
 	Seq          int64  `json:"n"`
@@ -82,6 +93,10 @@ type wireRecord struct {
 	CacheRead    int64  `json:"cr,omitempty"`
 	CacheWrite5m int64  `json:"c5,omitempty"`
 	CacheWrite1h int64  `json:"c1,omitempty"`
+	PRRepo       string `json:"pr,omitempty"`
+	PRNumber     int64  `json:"prn,omitempty"`
+	CWD          string `json:"cwd,omitempty"`
+	GitBranch    string `json:"br,omitempty"`
 	Sealed       []byte `json:"d"`
 }
 
@@ -93,6 +108,8 @@ func toWire(r store.Record) wireRecord {
 		RequestID: r.RequestID, Model: r.Model,
 		Input: r.Input, Output: r.Output, Thinking: r.Thinking,
 		CacheRead: r.CacheRead, CacheWrite5m: r.CacheWrite5m, CacheWrite1h: r.CacheWrite1h,
+		PRRepo: r.PRRepo, PRNumber: r.PRNumber,
+		CWD: r.CWD, GitBranch: r.GitBranch,
 		Sealed: r.Sealed,
 	}
 }
@@ -105,6 +122,8 @@ func fromWire(w wireRecord) store.Record {
 		RequestID: w.RequestID, Model: w.Model,
 		Input: w.Input, Output: w.Output, Thinking: w.Thinking,
 		CacheRead: w.CacheRead, CacheWrite5m: w.CacheWrite5m, CacheWrite1h: w.CacheWrite1h,
+		PRRepo: w.PRRepo, PRNumber: w.PRNumber,
+		CWD: w.CWD, GitBranch: w.GitBranch,
 		Sealed: w.Sealed,
 	}
 }

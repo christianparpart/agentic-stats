@@ -49,6 +49,11 @@ type Record struct {
 	PRRepo   string
 	PRNumber int64
 
+	// CWD is the working directory the line was written in, which is this
+	// archive's project identity, and GitBranch the branch checked out there.
+	CWD       string
+	GitBranch string
+
 	Sealed []byte
 }
 
@@ -200,9 +205,9 @@ const insertSQL = `
 	     session_id, line_uuid, captured_at,
 	     request_id, model, input_tokens, output_tokens, think_tokens,
 	     cache_read, cache_write5m, cache_write1h,
-	     pr_repo, pr_number,
+	     pr_repo, pr_number, cwd, git_branch,
 	     sealed, received_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT DO NOTHING`
 
 // execInsert runs one insert and reports whether a row was written.
@@ -213,6 +218,7 @@ func execInsert(ctx context.Context, stmt *sql.Stmt, r Record, now string) (int6
 		nullable(r.RequestID), nullable(r.Model),
 		r.Input, r.Output, r.Thinking, r.CacheRead, r.CacheWrite5m, r.CacheWrite1h,
 		nullable(r.PRRepo), nullableInt(r.PRNumber),
+		nullable(r.CWD), nullable(r.GitBranch),
 		r.Sealed, now)
 	if err != nil {
 		return 0, fmt.Errorf("store: insert record: %w", err)
@@ -294,7 +300,8 @@ func (db *DB) Since(ctx context.Context, origin string, after int64, limit int) 
 		       coalesce(captured_at, ''), coalesce(request_id, ''), coalesce(model, ''),
 		       input_tokens, output_tokens, think_tokens,
 		       cache_read, cache_write5m, cache_write1h,
-		       coalesce(pr_repo, ''), coalesce(pr_number, 0), sealed
+		       coalesce(pr_repo, ''), coalesce(pr_number, 0),
+		       coalesce(cwd, ''), coalesce(git_branch, ''), sealed
 		  FROM records
 		 WHERE origin_id = ? AND seq > ?
 		 ORDER BY seq
@@ -311,7 +318,7 @@ func (db *DB) Since(ctx context.Context, origin string, after int64, limit int) 
 			&r.ContentHash, &r.SessionID, &r.LineUUID, &r.CapturedAt,
 			&r.RequestID, &r.Model, &r.Input, &r.Output, &r.Thinking,
 			&r.CacheRead, &r.CacheWrite5m, &r.CacheWrite1h,
-			&r.PRRepo, &r.PRNumber, &r.Sealed); err != nil {
+			&r.PRRepo, &r.PRNumber, &r.CWD, &r.GitBranch, &r.Sealed); err != nil {
 			return nil, fmt.Errorf("store: scan record: %w", err)
 		}
 		out = append(out, r)

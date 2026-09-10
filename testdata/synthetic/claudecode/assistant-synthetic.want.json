@@ -1,0 +1,19 @@
+{
+  "SessionID": "sess-0001",
+  "LineUUID": "uuid-0003",
+  "CapturedAt": "2026-01-02T03:05:00.000Z",
+  "RequestID": "",
+  "Model": "",
+  "PRRepo": "",
+  "PRNumber": 0,
+  "CWD": "D:\\example-project",
+  "GitBranch": "master",
+  "Usage": {
+    "Input": 0,
+    "Output": 0,
+    "Thinking": 0,
+    "CacheRead": 0,
+    "CacheWrite5m": 0,
+    "CacheWrite1h": 0
+  }
+}
