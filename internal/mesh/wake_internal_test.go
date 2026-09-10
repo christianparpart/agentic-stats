@@ -10,7 +10,50 @@ import (
 func newForWake() *Mesh {
 	return &Mesh{
 		backoff: make(map[string]time.Time),
+		sighted: make(map[string]struct{}),
 		wake:    make(chan struct{}, 1),
+	}
+}
+
+// Discovering a peer must make the node speak to it, not merely write it down.
+// Waiting for the next sweep meant a fresh node -- which swept an empty list on
+// startup and has no stored peers -- sat next to its neighbour for the best part
+// of a minute.
+func TestOnlyTheFirstSightingOfAPeerNudges(t *testing.T) {
+	m := newForWake()
+
+	if !m.firstSighting("peer-a") {
+		t.Error("the first sighting of a peer was not treated as new")
+	}
+	// A beacon arrives from every peer every thirty seconds. Sweeping on each
+	// would be a busy loop wearing a discovery protocol as a hat.
+	for range 5 {
+		if m.firstSighting("peer-a") {
+			t.Error("a repeat sighting was treated as new")
+		}
+	}
+	if !m.firstSighting("peer-b") {
+		t.Error("a different peer's first sighting was not treated as new")
+	}
+}
+
+// nudge asks for a sweep; unlike Wake it must leave backoff alone, or one
+// machine waking up would trigger a retry storm against every machine that is
+// switched off.
+func TestNudgeSweepsWithoutClearingBackoff(t *testing.T) {
+	m := newForWake()
+	const addr = "sleeping.example:8844"
+	m.penalize(addr)
+
+	m.nudge()
+
+	select {
+	case <-m.wake:
+	default:
+		t.Error("nudge did not ask for a sweep")
+	}
+	if !m.inBackoff(addr) {
+		t.Error("nudge cleared backoff; only a resume should do that")
 	}
 }
 

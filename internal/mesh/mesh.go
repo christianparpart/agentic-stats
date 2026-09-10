@@ -86,6 +86,9 @@ type Mesh struct {
 
 	mu      sync.Mutex
 	backoff map[string]time.Time
+	// sighted is the node ids discovery has reported this run, so only a
+	// peer's first sighting nudges the dial loop.
+	sighted map[string]struct{}
 }
 
 // Wake retries every peer immediately, discarding any backoff.
@@ -102,7 +105,17 @@ func (m *Mesh) Wake() {
 	m.mu.Lock()
 	clear(m.backoff)
 	m.mu.Unlock()
+	m.nudge()
+}
 
+// nudge asks the dial loop to sweep now, leaving backoff intact.
+//
+// Separate from Wake because the two events mean different things. A resume
+// invalidates everything we believed about the network, so backoff goes. A peer
+// appearing on the network says nothing about the peers that are failing, and
+// clearing their backoff would turn one machine waking up into a retry storm
+// against every machine that is switched off.
+func (m *Mesh) nudge() {
 	select {
 	case m.wake <- struct{}{}:
 	default: // a sweep is already pending; one is enough
@@ -135,6 +148,7 @@ func New(cfg Config) (*Mesh, error) {
 		cfg: cfg, log: log, syncer: syncer, dialer: dialer,
 		nodeID:  nodeID,
 		backoff: make(map[string]time.Time),
+		sighted: make(map[string]struct{}),
 		wake:    make(chan struct{}, 1),
 	}, nil
 }
@@ -230,12 +244,39 @@ func (m *Mesh) seedStaticPeers(ctx context.Context) error {
 }
 
 // discovered records a peer seen on the network.
+//
+// A peer we have not seen before also wakes the dial loop. Recording it and
+// waiting for the next sweep meant a node could discover a neighbour within a
+// second and then sit next to it for the best part of a minute before speaking
+// to it -- and on a fresh node, which has no stored peers and swept an empty
+// list on startup, that was the whole of its first minute.
+//
+// Only the first sighting nudges. A beacon arrives from every peer every thirty
+// seconds, and sweeping on each would be a busy loop wearing a discovery
+// protocol as a hat.
 func (m *Mesh) discovered(p beacon.Peer) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := m.cfg.Store.SavePeer(ctx, store.Peer{ID: p.NodeID, Addrs: p.Addrs}); err != nil {
 		m.log.Debug("record discovered peer", "peer", p.NodeID, "error", err)
+		return
 	}
+	if m.firstSighting(p.NodeID) {
+		m.log.Info("discovered a peer", "peer", p.NodeID, "addrs", p.Addrs)
+		m.nudge()
+	}
+}
+
+// firstSighting reports whether this is the first time we have seen a node id
+// since this process started, recording it either way.
+func (m *Mesh) firstSighting(nodeID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, known := m.sighted[nodeID]; known {
+		return false
+	}
+	m.sighted[nodeID] = struct{}{}
+	return true
 }
 
 // accept converges with every peer that connects to us.
