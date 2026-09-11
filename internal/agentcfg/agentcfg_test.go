@@ -1,6 +1,7 @@
 package agentcfg_test
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -105,4 +106,49 @@ func TestSaveWritesOwnerOnlyPermissions(t *testing.T) {
 	}
 	assertOwnerOnly(t, path)
 
+}
+
+// A fleet where every machine must be told to upgrade does not converge, so
+// the default is on -- and that means an omitted key must not read as false.
+func TestUpdateIsEnabledUnlessTurnedOff(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"no config file at all", "", true},
+		{"a config that never mentions updates", "[mesh]\npsk = \"k\"\n", true},
+		{"a section with only an interval", "[update]\ninterval = \"2h\"\n", true},
+		{"explicitly on", "[update]\nenabled = true\n", true},
+		// The machine somebody is developing on.
+		{"explicitly off", "[update]\nenabled = false\n", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if tt.body != "" {
+				if err := os.WriteFile(path, []byte(tt.body), 0o600); err != nil {
+					t.Fatalf("write: %v", err)
+				}
+			}
+			cfg, err := agentcfg.Load(path)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.Update.Enabled != tt.want {
+				t.Errorf("Update.Enabled = %v, want %v", cfg.Update.Enabled, tt.want)
+			}
+		})
+	}
+}
+
+func TestUpdateIntervalDefaults(t *testing.T) {
+	cfg, err := agentcfg.Load(filepath.Join(t.TempDir(), "absent.toml"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Update.Interval != "1h" {
+		t.Errorf("Update.Interval = %q, want the 1h default", cfg.Update.Interval)
+	}
 }

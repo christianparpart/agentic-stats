@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -445,5 +446,61 @@ func TestNewRequiresItsDependencies(t *testing.T) {
 				t.Error("New returned an Updater that cannot work")
 			}
 		})
+	}
+}
+
+// The daemon must only be taken down once a new build is actually in place.
+// Stopping after a failed install would restart onto the build it was already
+// running, and do it again at every interval.
+func TestRunKeepsRunningWhenTheInstallFails(t *testing.T) {
+	v, f := buildRelease(t, "v0.2.0", map[string]string{"agentic-stats-linux-amd64": "x"})
+	inst := &recordingInstaller{err: errors.New("permission denied")}
+	tick := make(chan time.Time)
+	u, err := update.New(update.Config{
+		Verifier: v, Fetcher: f, Peers: fakePeers{"v0.2.0"}, Installer: inst,
+		Current: "v0.1.0", StageDir: t.TempDir(), GOOS: "linux", GOARCH: "amd64",
+		Tick: tick,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- u.Run(ctx) }()
+
+	tick <- time.Now() // a second attempt, still failing
+	cancel()
+
+	if err := <-done; err != nil {
+		t.Errorf("Run = %v, want nil: a failed install is not a reason to stop", err)
+	}
+	if inst.calls < 2 {
+		t.Errorf("installer tried %d times, want it to keep trying", inst.calls)
+	}
+}
+
+// Every staged download is temporary. Leaving 16 MB files behind on every
+// failed attempt would fill a temp directory a node never looks at.
+func TestStagedDownloadsAreCleanedUp(t *testing.T) {
+	stage := t.TempDir()
+	v, f := buildRelease(t, "v0.2.0", map[string]string{"agentic-stats-linux-amd64": "the new binary"})
+	u, err := update.New(update.Config{
+		Verifier: v, Fetcher: f, Peers: fakePeers{"v0.2.0"}, Installer: &recordingInstaller{},
+		Current: "v0.1.0", StageDir: stage, GOOS: "linux", GOARCH: "amd64",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := u.Pass(context.Background()); err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+
+	left, err := os.ReadDir(stage)
+	if err != nil {
+		t.Fatalf("read staging dir: %v", err)
+	}
+	if len(left) != 0 {
+		t.Errorf("staging directory still holds %d files", len(left))
 	}
 }
