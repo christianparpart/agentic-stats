@@ -54,3 +54,25 @@ func windowlessPath(exe string) string {
 	}
 	return base + WindowlessSuffix + ext
 }
+
+// WindowlessPath is the GUI-subsystem twin of an executable path.
+//
+// Exported for the updater, which has to replace both binaries: replacing only
+// the console build would leave the service running the old code, since that
+// is the one serviceBinary registered. Idempotent, so it is safe to call on a
+// path that is already the twin.
+func WindowlessPath(exe string) string { return windowlessPath(exe) }
+
+// ConsolePath is the command-line twin of an executable path.
+//
+// The inverse of WindowlessPath, and idempotent in the same way. A daemon
+// asking what to replace knows only its own path, and that is the windowless
+// one whenever the service started it -- so it needs both directions.
+func ConsolePath(exe string) string {
+	ext := filepath.Ext(exe)
+	base := strings.TrimSuffix(exe, ext)
+	if !strings.HasSuffix(base, WindowlessSuffix) {
+		return exe // already the console build
+	}
+	return strings.TrimSuffix(base, WindowlessSuffix) + ext
+}
