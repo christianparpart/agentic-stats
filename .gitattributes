@@ -1,21 +1,26 @@
-# Source files are LF in the working tree on every platform.
+# Every text file is LF, in the repository and in the working tree, on every
+# platform.
 #
 # Without this, a Windows clone with the common core.autocrlf=true setting gets
 # CRLF on disk, and `gofmt -l` then reports every Go file in the repository as
 # unformatted -- so `make check`, which AGENT.md requires before every commit,
 # cannot pass there at all. The agent ships on Windows, so a contributor on
 # Windows must be able to run the same checks as CI.
-*.go      text eol=lf
-*.sql     text eol=lf
-*.toml    text eol=lf
-*.md      text eol=lf
-*.yml     text eol=lf
-*.yaml    text eol=lf
-*.sh      text eol=lf
-*.html    text eol=lf
-*.json    text eol=lf
-.githooks/* text eol=lf
+#
+# Declared once for everything rather than per extension: a list of extensions
+# only protects the types somebody remembered, and the file that gets it wrong
+# is always the one added later.
+* text=auto eol=lf
 
+# Exceptions, where the bytes are the content and a rewrite would change what
+# the file means.
+#
 # Transcript fixtures are compared byte for byte; a line-ending rewrite would
 # change the content hashes the parser tests are pinned to.
-*.jsonl   -text
+*.jsonl -text
+
+# A release manifest and its detached signature are the exact bytes that were
+# signed. A line-ending rewrite changes them, and the signature then verifies
+# nowhere -- which on a Windows clone would make the update client's own test
+# fail against a release that is perfectly good.
+internal/update/testdata/** -text
