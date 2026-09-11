@@ -37,6 +37,7 @@ import (
 	"github.com/christianparpart/agentic-stats/internal/ingest"
 	"github.com/christianparpart/agentic-stats/internal/mesh"
 	"github.com/christianparpart/agentic-stats/internal/pricing"
+	"github.com/christianparpart/agentic-stats/internal/release"
 	"github.com/christianparpart/agentic-stats/internal/resume"
 	"github.com/christianparpart/agentic-stats/internal/seal"
 	"github.com/christianparpart/agentic-stats/internal/service"
@@ -61,6 +62,9 @@ Usage:
   agentic-stats run      Collect continuously and serve the dashboard
   agentic-stats status   Report what this node holds
   agentic-stats version  Report this build
+
+  agentic-stats verify-release <dir>  Check a downloaded release against the
+                                      signing key built into this binary
 
   agentic-stats reprocess  Re-read archived records for columns this build
                            extracts and older ones did not
@@ -97,6 +101,12 @@ func run(args []string) error {
 	// runs first, where an exit 1 reads as a broken binary.
 	if len(args) > 0 && (args[0] == "version" || args[0] == "--version") {
 		return runVersion()
+	}
+	// Also before the config path: checking a download is something you do
+	// with a binary you have just fetched, on a machine that may have no
+	// configuration at all yet.
+	if len(args) > 0 && args[0] == "verify-release" {
+		return runVerifyRelease(args[1:])
 	}
 
 	defaultPath, err := agentcfg.DefaultPath()
@@ -156,6 +166,89 @@ func runVersion() error {
 		unreleased = " (unreleased)"
 	}
 	fmt.Printf("agentic-stats %s %s/%s%s\n", v, runtime.GOOS, runtime.GOARCH, unreleased)
+	return nil
+}
+
+// runVerifyRelease checks a downloaded release against the built-in key.
+//
+// The signature is only worth something if the person holding the artifacts
+// can check it, and the tool that checks it has to be one they already trust.
+// That is this binary: the public key is compiled into it, so verifying with
+// it is the same act a node performs on itself.
+func runVerifyRelease(args []string) error {
+	fs := flag.NewFlagSet("verify-release", flag.ExitOnError)
+	expect := fs.String("version", "", "also require the release to name this version")
+
+	// The directory is lifted out before flag parsing rather than read back
+	// with fs.Arg. Go's flag package stops at the first non-flag argument, so
+	// `verify-release dist --version v0.1.0` -- the order anyone would
+	// actually type, and the order the README shows -- would leave --version
+	// unparsed and silently skip the check it was asked for.
+	dir := ""
+	rest := make([]string, 0, len(args))
+	for _, arg := range args {
+		if dir == "" && !strings.HasPrefix(arg, "-") {
+			dir = arg
+			continue
+		}
+		rest = append(rest, arg)
+	}
+	if err := fs.Parse(rest); err != nil {
+		return err
+	}
+	if dir == "" {
+		return errors.New("verify-release needs the directory holding the release")
+	}
+
+	manifest, err := os.ReadFile(filepath.Join(dir, "SHA256SUMS"))
+	if err != nil {
+		return fmt.Errorf("read SHA256SUMS: %w", err)
+	}
+	signature, err := os.ReadFile(filepath.Join(dir, "SHA256SUMS.sig"))
+	if err != nil {
+		return fmt.Errorf("read SHA256SUMS.sig: %w", err)
+	}
+
+	v, err := release.Official()
+	if err != nil {
+		return err
+	}
+	m, err := v.Open(manifest, signature)
+	if err != nil {
+		return err
+	}
+	if *expect != "" && m.Version() != *expect {
+		return fmt.Errorf("release names %q, wanted %q", m.Version(), *expect)
+	}
+
+	// Only the artifacts actually present: someone verifying a download has
+	// the binary for their own platform, not all eight.
+	checked := 0
+	for _, name := range m.Names() {
+		f, ferr := os.Open(filepath.Join(dir, name))
+		if errors.Is(ferr, os.ErrNotExist) {
+			continue
+		}
+		if ferr != nil {
+			return fmt.Errorf("open %s: %w", name, ferr)
+		}
+		cerr := m.Check(name, f)
+		// Read-only, so Close reports nothing that changes the verdict.
+		_ = f.Close()
+		if cerr != nil {
+			return cerr
+		}
+		checked++
+	}
+	if checked == 0 {
+		return fmt.Errorf("no artifacts from that release are in %s", dir)
+	}
+
+	fmt.Printf("signature is genuine; %d of %d artifacts present and intact\n",
+		checked, len(m.Names()))
+	if m.Version() != "" {
+		fmt.Printf("release %s\n", m.Version())
+	}
 	return nil
 }
 

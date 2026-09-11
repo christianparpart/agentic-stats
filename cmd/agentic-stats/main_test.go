@@ -163,3 +163,27 @@ func TestVersionGapNamesTheDirectionOnlyWhenItIsKnown(t *testing.T) {
 		})
 	}
 }
+
+// `verify-release <dir> --version <v>` is the order anyone types, and the
+// order the README shows. Go's flag package stops at the first non-flag
+// argument, so a naive fs.Parse would leave --version unread and silently
+// skip the very check it was asked to make.
+func TestVerifyReleaseReadsTheVersionFlagAfterTheDirectory(t *testing.T) {
+	dir := t.TempDir()
+
+	// No release in the directory, so this always fails -- but it must fail
+	// on the version it was told to expect, proving the flag was parsed.
+	err := runVerifyRelease([]string{dir, "--version", "v9.9.9"})
+	if err == nil {
+		t.Fatal("verify-release succeeded against an empty directory")
+	}
+	// It gets as far as reading the manifest, which is absent; what matters
+	// is that argument order did not silently drop the flag.
+	if !strings.Contains(err.Error(), "SHA256SUMS") {
+		t.Errorf("error = %v, want it to have reached the manifest read", err)
+	}
+
+	if err := runVerifyRelease(nil); err == nil {
+		t.Error("verify-release with no directory succeeded")
+	}
+}

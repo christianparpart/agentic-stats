@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"path/filepath"
 	"slices"
 	"strings"
 )
@@ -129,7 +130,22 @@ func parseManifest(data []byte) (Manifest, error) {
 			return Manifest{}, fmt.Errorf("release: manifest line %d: %q is not a sha256 digest", line, fields[0])
 		}
 		// Binary mode marks the name with an asterisk; text mode does not.
-		digests[strings.TrimPrefix(fields[1], "*")] = sum
+		name := strings.TrimPrefix(fields[1], "*")
+		// A name is a plain filename, never a path. Names() is what an
+		// updater drives downloads from, so a name is eventually a write
+		// target: "../../something" must not survive that far, and a manifest
+		// that carries one is malformed whoever signed it.
+		if name != filepath.Base(name) || name == "." || name == ".." ||
+			strings.ContainsAny(name, `/\`) {
+			return Manifest{}, fmt.Errorf("release: manifest line %d: %q is not a plain file name", line, name)
+		}
+		// Rejected rather than overwritten: two digests for one artifact is a
+		// generation fault, and taking the last silently would publish a
+		// manifest that verifies while describing something ambiguous.
+		if _, dup := digests[name]; dup {
+			return Manifest{}, fmt.Errorf("release: manifest line %d: %s appears twice", line, name)
+		}
+		digests[name] = sum
 	}
 	if err := scan.Err(); err != nil {
 		return Manifest{}, fmt.Errorf("release: read manifest: %w", err)
