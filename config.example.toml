@@ -47,9 +47,15 @@ exclude_interfaces = [
 # upgrade does not converge, which is the point of having this at all. Only a
 # signed, tagged release is ever a candidate, and a node never downgrades.
 #
-# Turn it off on a machine whose own build you are working on. A local build is
-# unreleased, a release outranks anything unreleased, and the node would
-# replace its own binaries with whatever the mesh is running.
+# You should rarely need to turn this off. A node never downgrades, and an
+# unreleased build -- a working tree, a dirty checkout, a commit ahead of its
+# tag -- is never replaced at all: what is on the machine the software is
+# written on is ahead of anything published, so installing a release over it
+# would be a downgrade however the version strings sort. That machine also
+# cannot pull anyone else, because an unreleased build is never a target.
+#
+# Turn it off for a node you want pinned to the build it has, whatever the rest
+# of the fleet does.
 # enabled = false
 
 # How often to look. The versions come from ordinary peer exchanges, so this
