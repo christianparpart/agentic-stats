@@ -208,9 +208,13 @@ func TestAStalledHandshakeDoesNotBlockOtherPeers(t *testing.T) {
 // The regression this guards against is a leaked slot: if the pending-handshake
 // semaphore is not released on every path, a burst permanently reduces capacity
 // and eventually stops inbound peering altogether. The burst is deliberately
-// larger than the cap so that shedding is exercised too, and the assertion is
-// made after the burst has gone rather than during it -- while it is held the
-// listener is legitimately allowed to refuse.
+// larger than the cap so that shedding is exercised too.
+//
+// What is asserted is that capacity comes back, not that it comes back by any
+// particular moment. Closing the client ends of the burst does not itself free
+// the listener's slots -- the accept loop still has to take each socket off the
+// backlog and let each handshake fail -- so for a short while afterwards the
+// listener is still legitimately entitled to refuse.
 func TestTheListenerRecoversAfterABurstOfDeadConnections(t *testing.T) {
 	k, _ := keys(t)
 	l, err := channel.Listen(channel.Config{Keys: k, NodeID: "server-node"}, "127.0.0.1:0")
@@ -253,9 +257,24 @@ func TestTheListenerRecoversAfterABurstOfDeadConnections(t *testing.T) {
 		accepted <- c
 	}()
 
-	client, err := d.Dial(ctx, l.Addr().String())
-	if err != nil {
-		t.Fatalf("a real peer could not connect after the burst cleared: %v", err)
+	// Retried until the deadline rather than attempted once. A single attempt
+	// races the drain described above: an attempt that arrives while the burst
+	// is still being shed is closed mid-handshake, which the dialer reports as
+	// a connection that went away -- and that is the listener behaving as
+	// designed, not the failure this test is looking for.
+	//
+	// Retrying still proves the thing it exists to prove. A genuinely leaked
+	// slot never comes back, so no attempt within the deadline would succeed.
+	var client *channel.Conn
+	for {
+		var derr error
+		if client, derr = d.Dial(ctx, l.Addr().String()); derr == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			t.Fatalf("a real peer could not connect after the burst cleared: %v", derr)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 	defer func() { _ = client.Close() }() // test cleanup
 
