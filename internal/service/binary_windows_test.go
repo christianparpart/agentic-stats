@@ -78,3 +78,48 @@ func TestWindowlessPath(t *testing.T) {
 		}
 	}
 }
+
+// The names a release actually publishes must resolve to each other, or
+// `install` silently registers the console build and puts a window on screen
+// at every login -- which is the whole reason the second binary exists.
+//
+// This pins the release artifact naming to what windowlessPath looks for: the
+// "w" goes before the extension, not after the program name.
+func TestReleasedArtifactNamesResolveToTheirWindowlessTwin(t *testing.T) {
+	tests := []struct{ console, windowless string }{
+		{`C:\dl\agentic-stats-windows-amd64.exe`, `C:\dl\agentic-stats-windows-amd64w.exe`},
+		{`C:\dl\agentic-stats-windows-arm64.exe`, `C:\dl\agentic-stats-windows-arm64w.exe`},
+	}
+	for _, tc := range tests {
+		if got := windowlessPath(tc.console); got != tc.windowless {
+			t.Errorf("windowlessPath(%s) = %s, want %s", tc.console, got, tc.windowless)
+		}
+		// And idempotent, so running install with the twin does not look for
+		// a third binary that will never exist.
+		if got := windowlessPath(tc.windowless); got != tc.windowless {
+			t.Errorf("windowlessPath(%s) = %s, want it unchanged", tc.windowless, got)
+		}
+	}
+}
+
+// The end-to-end shape: a user downloads both artifacts into one directory and
+// runs the console one. serviceBinary must find the twin beside it.
+func TestServiceBinaryFindsTheReleasedTwinInADownloadDirectory(t *testing.T) {
+	dir := t.TempDir()
+	console := filepath.Join(dir, "agentic-stats-windows-amd64.exe")
+	twin := filepath.Join(dir, "agentic-stats-windows-amd64w.exe")
+	for _, p := range []string{console, twin} {
+		if err := os.WriteFile(p, []byte("stub"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+	}
+
+	notified := ""
+	got := serviceBinary(console, func(m string) { notified = m })
+	if got != twin {
+		t.Errorf("serviceBinary() = %s, want the windowless twin %s", got, twin)
+	}
+	if notified != "" {
+		t.Errorf("fell back with a warning (%q) despite the twin being present", notified)
+	}
+}

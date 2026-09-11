@@ -9,6 +9,12 @@ PLATFORMS := darwin/amd64 darwin/arm64 linux/amd64 linux/arm64 windows/amd64 win
 # a logon task shows a window at every login; a GUI-subsystem one does not, but
 # a shell will not wait for it, so it is unusable as a command line. The console
 # build is the CLI, and agentic-statsw.exe beside it is what the service runs.
+#
+# The released twin is named with the "w" before the extension --
+# agentic-stats-windows-amd64w.exe -- because that is where
+# service.windowlessPath looks for it. Put the "w" anywhere else and `install`
+# silently registers the console build, which is the window at every login the
+# second binary exists to avoid.
 GOOS_NOW := $(shell $(GO) env GOOS)
 
 # What the binary reports as its version, and what a peer reads to decide
@@ -104,7 +110,7 @@ release-binaries:
 		if [ "$$os" = "windows" ]; then \
 			CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch \
 				$(GO) build -trimpath -ldflags "-s -w -H windowsgui $(VERSION_LDFLAGS)" \
-				-o dist/agentic-statsw-$$os-$$arch$$ext ./cmd/agentic-stats || exit 1; \
+				-o dist/agentic-stats-$$os-$$arch"w"$$ext ./cmd/agentic-stats || exit 1; \
 		fi; \
 	done
 

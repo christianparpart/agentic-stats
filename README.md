@@ -63,13 +63,20 @@ chmod +x agentic-stats-linux-amd64
 that lives only in the release pipeline — no node holds it, so no node can forge a
 release. One signature covers the whole set, and the manifest names the version it
 belongs to, so artifacts cannot be mixed between releases and an old release cannot be
-passed off as a new one. The signature is what the pipeline checks before publishing;
-verifying it yourself needs the public half, which is compiled into every binary
-(`internal/release`).
+passed off as a new one. The public half is compiled into every binary, so any release
+can check another — or itself:
 
-Windows ships **two** binaries per architecture. `agentic-stats.exe` is the command line;
-`agentic-statsw.exe` beside it is what the service runs, and both belong in the same
-directory — see [Where a background node logs](#where-a-background-node-logs) for why.
+```sh
+./agentic-stats-linux-amd64 verify-release .            # signature and digests
+./agentic-stats-linux-amd64 verify-release . --version v0.1.0
+```
+
+Windows ships **two** binaries per architecture: `agentic-stats-windows-amd64.exe` is the
+command line, and `agentic-stats-windows-amd64w.exe` beside it is what the service runs.
+Download both into the same directory and keep the names — `install` finds the second by
+name, and without it the service registers the console build and shows a window at every
+login. See [Where a background node logs](#where-a-background-node-logs) for why there
+are two.
 
 ## Build from source
 

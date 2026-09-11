@@ -254,3 +254,40 @@ func TestNewVerifierRejectsAKeyOfTheWrongSize(t *testing.T) {
 		}
 	}
 }
+
+// A name in a manifest is eventually a path an updater writes to, so it must
+// be a plain filename however trustworthy the signature is.
+func TestParseRejectsNamesThatAreNotPlainFiles(t *testing.T) {
+	v, sign := signer(t)
+	sum := sha256.Sum256([]byte("x"))
+	digest := hex.EncodeToString(sum[:])
+
+	for _, name := range []string{
+		"../escaped",
+		"../../etc/passwd",
+		"sub/dir",
+		`sub\dir`,
+		".",
+		"..",
+	} {
+		t.Run(name, func(t *testing.T) {
+			body := []byte(digest + "  " + name + "\n")
+			if _, err := v.Open(body, sign(body)); err == nil {
+				t.Errorf("Open accepted %q as an artifact name", name)
+			}
+		})
+	}
+}
+
+// Two digests for one artifact is a generation fault. Taking the last one
+// silently would publish a manifest that verifies but describes two things.
+func TestParseRejectsADuplicateArtifact(t *testing.T) {
+	v, sign := signer(t)
+	body := []byte(
+		manifestFor(t, "agentic-stats-linux-amd64", "one") +
+			manifestFor(t, "agentic-stats-linux-amd64", "two"))
+
+	if _, err := v.Open(body, sign(body)); err == nil {
+		t.Error("Open accepted a manifest naming one artifact twice")
+	}
+}
