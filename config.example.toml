@@ -40,6 +40,22 @@ exclude_interfaces = [
   # "bridge100",
 ]
 
+[update]
+# Converge on the newest release your peers report, and restart to run it.
+#
+# On unless you say otherwise: a fleet where every machine has to be told to
+# upgrade does not converge, which is the point of having this at all. Only a
+# signed, tagged release is ever a candidate, and a node never downgrades.
+#
+# Turn it off on a machine whose own build you are working on. A local build is
+# unreleased, a release outranks anything unreleased, and the node would
+# replace its own binaries with whatever the mesh is running.
+# enabled = false
+
+# How often to look. The versions come from ordinary peer exchanges, so this
+# costs nothing but the decision to act on them.
+interval = "1h"
+
 [dashboard]
 # Loopback by default: http://127.0.0.1 is already a secure context in every
 # browser, so there is no certificate to manage and no warning. Bind elsewhere

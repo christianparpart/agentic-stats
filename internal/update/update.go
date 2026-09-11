@@ -43,7 +43,13 @@ const DefaultBaseURL = "https://github.com/christianparpart/agentic-stats"
 //
 // Returned rather than acted on inside a pass, so the decision to take the
 // daemon down belongs to the daemon rather than to this package.
-var ErrRestartPending = errors.New("update: a newer build is installed and needs a restart")
+//
+// Deliberately not prefixed with the package name, unlike the errors around
+// it. This one is only ever surfaced through the subsystem the supervisor
+// calls "update", which prefixes what it reports -- so the usual prefix would
+// print as "update: update: ...", and a daemon's last line before it exits is
+// the wrong place to look sloppy.
+var ErrRestartPending = errors.New("a newer build is installed and needs a restart")
 
 // Outcome is what one pass did.
 //

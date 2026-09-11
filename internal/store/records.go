@@ -605,6 +605,25 @@ func (db *DB) SaveHostname(ctx context.Context, ip, name string) error {
 	return nil
 }
 
+// PeerVersions is what every peer last reported running.
+//
+// Only the ones that said something: a peer too old to report a version, or
+// one that has never been reached, contributes nothing rather than an empty
+// string that a caller would have to know to ignore.
+func (db *DB) PeerVersions(ctx context.Context) ([]string, error) {
+	peers, err := db.Peers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(peers))
+	for _, p := range peers {
+		if p.Version != "" {
+			out = append(out, p.Version)
+		}
+	}
+	return out, nil
+}
+
 // PeerNames maps each known peer to the friendliest name this node has for it.
 //
 // A peer id is an origin id -- the mesh mints one from the other -- so this is

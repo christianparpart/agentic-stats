@@ -21,6 +21,21 @@ type Config struct {
 	Agent     AgentConfig     `toml:"agent"`
 	Privacy   PrivacyConfig   `toml:"privacy"`
 	Bridge    BridgeConfig    `toml:"bridge"`
+	Update    UpdateConfig    `toml:"update"`
+}
+
+// UpdateConfig controls converging on the newest release peers report.
+type UpdateConfig struct {
+	// Enabled upgrades this node to the newest release its peers report.
+	//
+	// True unless set otherwise, because a fleet where every machine has to be
+	// told to upgrade does not converge -- which is the whole point. Set it
+	// false on a machine whose own build is being worked on: a local build is
+	// unreleased, a release outranks anything unreleased, and the node would
+	// replace its own binaries from the mesh.
+	Enabled bool `toml:"enabled"`
+	// Interval is how often to look, as a duration string.
+	Interval string `toml:"interval"`
 }
 
 // BridgeConfig carries records through storage both machines can reach, for
@@ -102,6 +117,10 @@ func Load(path string) (Config, error) {
 		Agent:     AgentConfig{PollInterval: "30s", BatchMaxLines: 2000},
 		Dashboard: DashboardConfig{Listen: "127.0.0.1:8899"},
 		Mesh:      MeshConfig{Listen: ":8844", Discovery: true},
+		// Set before decoding, so an omitted key keeps the default and an
+		// explicit `enabled = false` still wins. A plain zero value would
+		// silently disable updates on every node that never mentions them.
+		Update: UpdateConfig{Enabled: true, Interval: "1h"},
 	}
 
 	data, err := os.ReadFile(path)

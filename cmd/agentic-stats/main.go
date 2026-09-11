@@ -704,6 +704,16 @@ func runNode(args []string, defaultPath string, m mode) error {
 			return n.runBridge(ctx, log)
 		}})
 	}
+	if updater, installer, err := n.buildUpdater(log); err != nil {
+		log.Warn("self-update is unavailable on this node", "error", err)
+	} else if updater != nil {
+		// Swept here rather than after an update, because this is the first
+		// moment the build it replaced is no longer running.
+		installer.SweepStale()
+		subsystems = append(subsystems, supervise.Config{Name: "update", Run: func(ctx context.Context) error {
+			return runUpdate(ctx, updater, log)
+		}})
+	}
 
 	runCtx, stopAll := context.WithCancel(ctx)
 	defer stopAll()
