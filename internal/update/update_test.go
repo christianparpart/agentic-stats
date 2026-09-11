@@ -41,9 +41,12 @@ func TestTargetPicksTheNewestReleaseAPeerReports(t *testing.T) {
 		{"a peer ahead of its tag", "v0.1.0", []string{"v9.9.9-5-gabc1234"}, ""},
 		{"a release among unreleased ones", "v0.1.0", []string{"dev", "v0.2.0", "v9.9.9-dirty"}, "v0.2.0"},
 
-		// A release outranks an unreleased build, so a node on dev converges
-		// onto the fleet rather than holding it back.
-		{"running dev, peers on a release", "dev", []string{"v0.1.0"}, "v0.1.0"},
+		// A working tree is ahead of anything published, so a release is not
+		// an upgrade for it. The box the software is written on keeps what is
+		// on it until someone deliberately replaces it.
+		{"running dev, peers on a release", "dev", []string{"v0.1.0"}, ""},
+		{"running a dirty tree", "v0.1.0-dirty", []string{"v9.9.9"}, ""},
+		{"running ahead of a tag", "v0.1.0-5-gabc1234", []string{"v9.9.9"}, ""},
 		{"running dev, peers also unreleased", "dev", []string{"dev"}, ""},
 	}
 
@@ -502,5 +505,31 @@ func TestStagedDownloadsAreCleanedUp(t *testing.T) {
 	}
 	if len(left) != 0 {
 		t.Errorf("staging directory still holds %d files", len(left))
+	}
+}
+
+// The box the software is written on must not have its working build replaced
+// by a published release. The release is older than the work in progress, so
+// installing it is a downgrade however the version strings sort.
+func TestAnUnreleasedBuildIsNeverReplaced(t *testing.T) {
+	for _, running := range []string{"dev", "v0.1.0-dirty", "v0.1.0-5-gabc1234", "abc1234", ""} {
+		t.Run(running, func(t *testing.T) {
+			got, ok := update.Target(version.Parse(running), []string{"v9.9.9", "v0.2.0"})
+			if ok {
+				t.Errorf("a node running %q would install %q over its own build", running, got)
+			}
+		})
+	}
+}
+
+// And the other direction, which is what stops a development box dragging
+// everyone else: what it announces can never be a target for anyone.
+func TestADevelopmentBoxCannotPullTheFleet(t *testing.T) {
+	for _, announced := range []string{"dev", "v9.9.9-dirty", "v9.9.9-5-gabc1234"} {
+		t.Run(announced, func(t *testing.T) {
+			if got, ok := update.Target(version.Parse("v0.1.0"), []string{announced}); ok {
+				t.Errorf("a peer announcing %q pulled a released node to %q", announced, got)
+			}
+		})
 	}
 }

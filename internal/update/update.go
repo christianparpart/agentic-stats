@@ -9,9 +9,13 @@
 // What it will run is a narrower question than what it will fetch. Only a
 // signed release can be a target -- the artifacts are checked against a
 // manifest this project signed, with a key no node holds -- and only one
-// strictly newer than the build asking. It never downgrades, and an unreleased
-// build can never be a target, so the machine somebody is developing on cannot
-// pull the fleet onto its working tree.
+// strictly newer than the build asking.
+//
+// It only ever upgrades, and that cuts both ways. An unreleased build is never
+// a target, so the machine somebody is developing on cannot pull the fleet
+// onto its working tree; and an unreleased build is never replaced either,
+// because that working tree is ahead of anything published and installing a
+// release over it would be a downgrade however the version strings sort.
 package update
 
 import (
@@ -359,6 +363,21 @@ func verifyFile(manifest release.Manifest, name, staged string) error {
 // than ranked: an unreleased build is not something another machine could
 // obtain even if it wanted to.
 func Target(current version.Version, reported []string) (string, bool) {
+	// An unreleased build is never replaced.
+	//
+	// It is a working tree -- the machine the software is being written on --
+	// and what is in it is ahead of anything published, not behind it.
+	// Installing a release over it would be a downgrade wearing an upgrade's
+	// clothes, and "only ever upgrade" has to mean that here too.
+	//
+	// The same conservatism as internal/version, and for the same reason:
+	// where the two cannot be ranked, the answer is to do nothing rather than
+	// to guess. A node deliberately given an unreleased build keeps it until
+	// someone deliberately takes it away.
+	if !current.IsRelease() {
+		return "", false
+	}
+
 	best := ""
 	bestV := version.Version{}
 	for _, raw := range reported {
