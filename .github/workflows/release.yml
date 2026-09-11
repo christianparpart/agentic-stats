@@ -70,11 +70,59 @@ jobs:
       - name: Verify what we are about to publish
         run: go run ./internal/release/cmd/relsign verify dist/SHA256SUMS dist/SHA256SUMS.sig dist
 
-      - name: Publish
+      # Uploaded as a draft, so nothing is downloadable until the upload itself
+      # has been checked. Everything above verifies what was *built*; a release
+      # is also an upload, and a partial one publishes a release some platform
+      # can never fetch.
+      - name: Upload as a draft
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes \
+            --draft \
             dist/*
+
+      # Checked against the signed manifest rather than a list written here.
+      # The manifest is generated from dist, so it already knows exactly what
+      # this release consists of -- and a second list would be a second home
+      # for the platform set, which has drifted from the Makefile's once
+      # already.
+      - name: Check every artifact actually arrived
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          expected="$(
+            { grep -v '^#' dist/SHA256SUMS | awk 'NF {print $2}' | sed 's/^\*//'
+              printf 'SHA256SUMS\nSHA256SUMS.sig\n'
+            } | sort -u
+          )"
+          actual="$(gh release view "${GITHUB_REF_NAME}" --json assets --jq '.assets[].name' | sort -u)"
+
+          missing="$(comm -23 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual"))"
+          extra="$(comm -13 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual"))"
+
+          if [ -n "$missing" ]; then
+            echo "::error::the draft is missing artifacts the manifest covers:"
+            printf '  %s\n' $missing
+          fi
+          # An asset the manifest does not cover is unsigned, and shipping one
+          # inside a signed release is the thing the signature exists to stop.
+          if [ -n "$extra" ]; then
+            echo "::error::the draft carries artifacts the signed manifest does not cover:"
+            printf '  %s\n' $extra
+          fi
+          if [ -n "$missing" ] || [ -n "$extra" ]; then
+            echo "The draft is left in place for inspection. Delete it with"
+            echo "  gh release delete ${GITHUB_REF_NAME} --yes --cleanup-tag"
+            echo "before re-pushing the tag."
+            exit 1
+          fi
+
+          printf '%s\n' "$actual" | wc -l | xargs printf '%s artifacts present and all covered by the manifest\n'
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "${GITHUB_REF_NAME}" --draft=false --latest
