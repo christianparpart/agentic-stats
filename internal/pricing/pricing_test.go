@@ -50,18 +50,56 @@ func TestCostUsesPublishedRates(t *testing.T) {
 	}
 }
 
-// Fable 5.1 departs from the usual cache-read multiplier; the table must say so.
-func TestFableCacheReadRateIsExplicit(t *testing.T) {
+// Some models depart from the usual cache-read multiplier; the table must say so.
+func TestCacheReadRateIsExplicitWhereItDeparts(t *testing.T) {
 	table, err := pricing.Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	m, ok := table.Lookup("claude-fable-5-1")
-	if !ok {
-		t.Fatal("claude-fable-5-1 must be priced")
+	tests := []struct {
+		model string
+		want  float64
+		why   string
+	}{
+		{"claude-fable-5-1", 0.25, "a quarter of the usual 0.1x"},
+		{"claude-opus-5-5", 0.20, "half of the usual 0.1x"},
 	}
-	if m.CacheRead != 0.25 {
-		t.Errorf("cache read = %v, want 0.25 (a quarter of the usual 0.1x)", m.CacheRead)
+	for _, tc := range tests {
+		m, ok := table.Lookup(tc.model)
+		if !ok {
+			t.Errorf("%s must be priced", tc.model)
+			continue
+		}
+		if m.CacheRead != tc.want {
+			t.Errorf("%s cache read = %v, want %v (%s)", tc.model, m.CacheRead, tc.want, tc.why)
+		}
+	}
+}
+
+// Every model in use must be priced: an unpriced one costs nothing on the
+// dashboard, so weeks of work on a newly released model read as idle.
+func TestCurrentModelsArePriced(t *testing.T) {
+	table, err := pricing.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	const million = 1_000_000
+	tests := []struct {
+		model string
+		want  float64 // one million input plus one million output
+	}{
+		{"claude-opus-5-5", 4.0 + 20.0},
+		{"claude-sonnet-5-5", 2.0 + 10.0},
+	}
+	for _, tc := range tests {
+		cost, ok := table.Cost(tc.model, pricing.Usage{Input: million, Output: million})
+		if !ok {
+			t.Errorf("%s must be priced", tc.model)
+			continue
+		}
+		if math.Abs(cost-tc.want) > 1e-9 {
+			t.Errorf("%s cost = %v, want %v", tc.model, cost, tc.want)
+		}
 	}
 }
 
